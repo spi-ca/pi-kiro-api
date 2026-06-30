@@ -31,10 +31,10 @@
     "NOTICE"
   ],
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*"
+    "@earendil-works/pi-ai": "*"
   },
   "devDependencies": {
-    "@mariozechner/pi-ai": "^0.73.1",
+    "@earendil-works/pi-ai": "^0.80.2",
     "@types/node": "^26.0.1",
     "jiti": "^2.7.0",
     "typescript": "^6.0.3"

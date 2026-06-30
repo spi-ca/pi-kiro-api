@@ -24,8 +24,8 @@ import type {
   ThinkingContent,
   ToolCall,
   ToolResultMessage,
-} from "@mariozechner/pi-ai";
-import { calculateCost, createAssistantMessageEventStream } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
+import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { log, previewChunk } from "./debug.ts";
 import { parseKiroEvents } from "./event-parser.ts";
 import type { KiroModel } from "./models.ts";
