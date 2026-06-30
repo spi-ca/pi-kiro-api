@@ -1,0 +1,42 @@
+{
+  "name": "pi-kiro-api",
+  "version": "0.2.0",
+  "description": "Kiro API-key provider for pi using KIRO_API_KEY. Vendors pi-kiro's streaming core (MIT) with no runtime dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "kiro",
+    "provider"
+  ],
+  "pi": {
+    "extensions": [
+      "./extension.ts"
+    ]
+  },
+  "main": "./extension.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/satiyap/pi-kiro-api.git"
+  },
+  "homepage": "https://github.com/satiyap/pi-kiro-api#readme",
+  "bugs": "https://github.com/satiyap/pi-kiro-api/issues",
+  "author": "satiyap",
+  "files": [
+    "extension.ts",
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "^0.73.1",
+    "@types/node": "^26.0.1",
+    "jiti": "^2.7.0",
+    "typescript": "^6.0.3"
+  }
+}
