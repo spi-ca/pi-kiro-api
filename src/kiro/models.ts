@@ -7,7 +7,13 @@
 // API (e.g. "claude-sonnet-4.6"). Everything in this file is in the pi/dash
 // form except KIRO_MODEL_IDS and the output of resolveKiroModel.
 
-/** Canonical Kiro API IDs (dot form) accepted by the server. */
+/**
+ * Static snapshot of Kiro API IDs (dot form). No longer the source of truth:
+ * discover.ts queries ListAvailableModels at startup and that result gates
+ * requests. This set remains only as a fallback for `resolveKiroModel` when
+ * discovery has not run, and as the source of the client-side behavior flags
+ * and `-1m` variants the API does not report. Expect it to lag the service.
+ */
 export const KIRO_MODEL_IDS = new Set<string>([
   "claude-opus-4.8",
   "claude-opus-4.7",
@@ -32,67 +38,35 @@ export const KIRO_MODEL_IDS = new Set<string>([
   "auto",
 ]);
 
+/**
+ * IDs confirmed by ListAvailableModels at startup (dot form). Populated by
+ * discover.ts. Discovery is authoritative for what this key may use, so once
+ * it has run these IDs — not the static snapshot above — gate requests.
+ */
+const discoveredModelIds = new Set<string>();
+
+/** Record the dot-form IDs discovery accepted. */
+export function setDiscoveredModelIds(kiroIds: Iterable<string>): void {
+  discoveredModelIds.clear();
+  for (const id of kiroIds) discoveredModelIds.add(id);
+}
+
 /** Convert pi's dash form to the Kiro API's dot form (e.g. 4-6 → 4.6). */
 export function resolveKiroModel(modelId: string): string {
   const kiroId = modelId.replace(/(\d)-(\d)/g, "$1.$2");
-  if (!KIRO_MODEL_IDS.has(kiroId)) {
+  // Prefer the discovered set; fall back to the static snapshot only when
+  // discovery has not run (e.g. a direct streamKiro call in a test).
+  const known = discoveredModelIds.size > 0 ? discoveredModelIds : KIRO_MODEL_IDS;
+  if (!known.has(kiroId)) {
     throw new Error(`Unknown Kiro model ID: ${modelId}`);
   }
   return kiroId;
 }
 
-/**
- * Models available per API region (allowlist). Unknown regions fall back to
- * the full catalog — update this map when Kiro launches in a new region.
- * Source: https://kiro.dev/docs/cli/models/
- */
-const MODELS_BY_REGION: Record<string, Set<string>> = {
-  "us-east-1": new Set([
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-opus-4-6-1m",
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-6-1m",
-    "claude-opus-4-5",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-5-1m",
-    "claude-sonnet-4",
-    "claude-haiku-4-5",
-    "deepseek-3-2",
-    "kimi-k2-5",
-    "minimax-m2-1",
-    "minimax-m2-5",
-    "glm-4-7",
-    "glm-4-7-flash",
-    "qwen3-coder-next",
-    "qwen3-coder-480b",
-    "agi-nova-beta-1m",
-    "auto",
-  ]),
-  "eu-central-1": new Set([
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4",
-    "claude-haiku-4-5",
-    "minimax-m2-1",
-    "minimax-m2-5",
-    "qwen3-coder-next",
-    "auto",
-  ]),
-};
-
-export function filterModelsByRegion<T extends { id: string }>(
-  models: T[],
-  apiRegion: string,
-): T[] {
-  const allowed = MODELS_BY_REGION[apiRegion];
-  if (!allowed) return models;
-  return models.filter((m) => allowed.has(m.id));
-}
+// The former MODELS_BY_REGION allowlist is gone. ListAvailableModels is
+// queried against the regional endpoint with the caller's key, so the server
+// already scopes the result by region, org, and entitlement — a hand-kept
+// region map could only drift out of agreement with it.
 
 /** Default Kiro API-key endpoint (service root, not the OAuth path). */
 const BASE_URL = "https://q.us-east-1.amazonaws.com/";

@@ -78,6 +78,10 @@ region:
 export KIRO_API_REGION="eu-central-1"
 ```
 
+API keys appear to be region-scoped: using a key against a region it was not
+issued for returns `AccessDeniedException` ("bearer token ... is invalid")
+during model discovery, so set this to the region your key belongs to.
+
 Optional logging:
 
 ```bash
@@ -94,7 +98,31 @@ pi --list-models
 ```
 
 Look for the `Kiro (API Key)` provider. Model IDs use pi's dash form, for
-example `claude-opus-4-8`, `claude-sonnet-4-6`, and `auto`.
+example `claude-opus-5`, `claude-sonnet-4-6`, and `auto`.
+
+### Model discovery
+
+The model list is not hardcoded. At startup the extension calls Kiro's
+`ListAvailableModels` operation with your key and registers exactly what
+that returns, so org-scoped and entitlement-gated models appear correctly
+and retired models disappear on their own.
+
+pi awaits the extension factory, so discovery finishes before startup
+continues and the list is available to interactive sessions and
+`pi --list-models` alike. This adds one HTTP round trip (15s timeout) to
+startup.
+
+Discovery is **fail-closed**: if the call fails, the provider does not
+register and pi reports an extension load error. There is no fallback to a
+built-in list, since a stale list would both offer models your key cannot
+use and hide ones it can. Consequently `KIRO_API_KEY` must be set for the
+provider to load at all.
+
+Two details the API does not report are still maintained in
+`src/kiro/models.ts` and merged onto the discovered models: the
+hidden-reasoning/first-token-timeout behavior flags, and the `-1m`
+long-context variants (a client-side ID convention, derived only when the
+API confirmed the corresponding base model).
 
 ## How it differs from pi-kiro
 
@@ -106,6 +134,10 @@ example `claude-opus-4-8`, `claude-sonnet-4-6`, and `auto`.
   which API-key auth doesn't use. The earlier patch-based version had to
   monkeypatch `globalThis.fetch` and `console.warn` to work around that;
   this version owns the stream code, so no global patching is needed.
+- Discovers models at startup via `ListAvailableModels` instead of shipping
+  a static catalog. Note that operation lives on the
+  `AmazonCodeWhispererService` target prefix, not the
+  `AmazonCodeWhispererStreamingService` prefix used for chat.
 
 ## Attribution
 
