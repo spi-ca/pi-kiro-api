@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Message, Model } from "@earendil-works/pi-ai";
 import { log } from "../src/kiro/debug.ts";
 import { streamKiro } from "../src/kiro/stream.ts";
 
@@ -160,6 +160,80 @@ test("closes provider blocks when the response reader rejects after partial outp
         }),
       }),
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("sanitizes cross-provider history before sending Kiro request body", async () => {
+  const originalFetch = globalThis.fetch;
+  const codexToolCallId =
+    "call_e94N00RInNHYopGvSJ49bbMu|fc_097faed57d5fbcf0016a7c371cfbac81919b3ce873bab9ad00";
+  const messages: Message[] = [
+    { role: "user", content: "start", timestamp: 0 },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "private signed reasoning" },
+        { type: "text", text: "I will run a command." },
+        { type: "toolCall", id: codexToolCallId, name: "bash", arguments: { command: "true" } },
+      ],
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      model: "gpt-5.5",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "toolUse",
+      timestamp: 0,
+    },
+    {
+      role: "toolResult",
+      toolCallId: codexToolCallId,
+      toolName: "bash",
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+      timestamp: 0,
+    },
+    { role: "user", content: "continue", timestamp: 0 },
+  ];
+  let requestBody: unknown;
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body));
+    return new Response('{"content":"done"}', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const events = await collectEvents(streamKiro(MODEL, { messages, tools: [] }, { apiKey: "test-key" }));
+    expect(events.at(-1)?.type).toBe("done");
+
+    const body = requestBody as {
+      conversationState: {
+        currentMessage: { userInputMessage: { content: string } };
+        history: Array<{
+          assistantResponseMessage?: { content: string; toolUses?: Array<{ toolUseId: string }> };
+          userInputMessage?: { userInputMessageContext?: { toolResults?: Array<{ toolUseId: string }> } };
+        }>;
+      };
+    };
+    const serialized = JSON.stringify(body);
+    const toolUseId = body.conversationState.history[1]?.assistantResponseMessage?.toolUses?.[0]?.toolUseId;
+    const toolResultId =
+      body.conversationState.history[2]?.userInputMessage?.userInputMessageContext?.toolResults?.[0]
+        ?.toolUseId;
+
+    expect(body.conversationState.currentMessage.userInputMessage.content).toBe("continue");
+    expect(toolUseId).toBe(toolResultId);
+    expect(toolUseId).toMatch(/^[a-zA-Z0-9_-]+$/);
+    expect(toolUseId!.length).toBeLessThanOrEqual(64);
+    expect(serialized).not.toContain("|");
+    expect(serialized).not.toContain("private signed reasoning");
+    expect(serialized).not.toContain("<thinking>");
   } finally {
     globalThis.fetch = originalFetch;
   }
