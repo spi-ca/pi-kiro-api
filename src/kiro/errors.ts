@@ -1,0 +1,60 @@
+const MAX_ERROR_BODY_BYTES = 4_096;
+const MAX_ERROR_CODE_LENGTH = 120;
+
+/** Read no more than `limit` bytes so error handling cannot buffer an attacker-controlled body. */
+export async function readResponseTextBounded(response: Response, limit = MAX_ERROR_BODY_BYTES): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (bytes < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = limit - bytes;
+      const chunk = value.byteLength > remaining ? value.slice(0, remaining) : value;
+      chunks.push(chunk);
+      bytes += chunk.byteLength;
+      if (chunk.byteLength < value.byteLength) break;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  const joined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
+
+/** Accept only compact provider identifiers, never arbitrary service prose. */
+function stableCode(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const code = value.trim();
+  return /^[A-Za-z0-9._:-]+$/.test(code) ? code.slice(0, MAX_ERROR_CODE_LENGTH) : undefined;
+}
+
+/**
+ * Expose only stable, bounded diagnostics. Do not include an arbitrary raw
+ * service body: it can contain request details, account data, or HTML.
+ */
+export function sanitizeKiroError(status: number, _statusText: string, body: string): string {
+  let code: string | undefined;
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    code = stableCode(parsed.code ?? parsed.errorCode ?? parsed.__type ?? parsed.type);
+  } catch {
+    // A non-JSON body supplies no safe provider diagnostic.
+  }
+
+  return `HTTP ${status}${code ? ` (code=${code})` : ""}`;
+}
+
+/** Streaming frames expose a stable code only, never arbitrary service prose. */
+export function sanitizeKiroStreamEventError(code: unknown, _message: unknown): string {
+  return `code=${stableCode(code) ?? "unknown"}`;
+}

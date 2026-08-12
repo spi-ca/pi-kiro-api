@@ -11,8 +11,9 @@
 // exact failure mode dynamic discovery exists to prevent.
 
 import { log } from "./debug.ts";
+import { readResponseTextBounded, sanitizeKiroError } from "./errors.ts";
 import { KIRO_ORIGIN } from "./transform.ts";
-import { kiroModels, setDiscoveredModelIds, type KiroModel } from "./models.ts";
+import { kiroModels, type KiroModel } from "./models.ts";
 
 /**
  * Note the service prefix: the list operation lives on
@@ -63,10 +64,11 @@ const BEHAVIOR_BY_KIRO_ID: Record<string, Partial<KiroModel>> = Object.fromEntri
 
 /**
  * Long-context variants are a client-side convention: the API advertises
- * e.g. `claude-sonnet-4.6` but also accepts `claude-sonnet-4.6-1m`, which
- * the list response never mentions. Derive them from the static catalog so
- * they remain selectable, but only when the API confirmed the base model —
- * that keeps the org-scoping guarantee intact.
+ * e.g. `claude-sonnet-4.6` but also accepts the derived
+ * `claude-sonnet-4.6-1m` form, which the list response never mentions. This
+ * is Kiro's `-1m` exception to literal response IDs. Derive it only when the
+ * API confirmed the base model, preserving the entitlement boundary for every
+ * other ID.
  */
 const ONE_M_SUFFIX = "-1m";
 const ONE_M_CONTEXT = 1_000_000;
@@ -164,6 +166,9 @@ export async function discoverKiroModels(
       // stream.ts sends on GenerateAssistantResponse, or we would advertise
       // models the chat path cannot actually use.
       body: JSON.stringify({ origin: KIRO_ORIGIN }),
+      // API-key requests must not follow a redirect to an attacker-controlled
+      // origin carrying the Authorization header.
+      redirect: "error",
       signal: combined,
     });
   } catch (err) {
@@ -176,16 +181,12 @@ export async function discoverKiroModels(
   }
 
   if (!response.ok) {
-    let detail = "";
-    try {
-      detail = (await response.text()).slice(0, 500);
-    } catch {
-      detail = "";
+    const detail = await readResponseTextBounded(response).catch(() => "");
+    const safe = sanitizeKiroError(response.status, response.statusText, detail);
+    if (log.isUnsafeDebugPayloadEnabled()) {
+      log.debug("discover.error.payload", { status: response.status, body: detail });
     }
-    log.debug("discover.error", { status: response.status, body: detail });
-    throw new Error(
-      `Kiro model discovery failed: HTTP ${response.status}${detail ? ` — ${detail}` : ""}`,
-    );
+    throw new Error(`Kiro model discovery failed: ${safe}`);
   }
 
   const payload = (await response.json()) as ListResponse;
@@ -200,12 +201,14 @@ export async function discoverKiroModels(
   const discovered = apiModels
     .filter((m) => typeof m.modelId === "string" && m.modelId.length > 0)
     .map((m) => toKiroModel(m, baseUrl));
+  if (discovered.length === 0) {
+    throw new Error(
+      "Kiro model discovery returned no valid models for this API key. " +
+        "The response did not contain a usable model ID.",
+    );
+  }
 
   const models = [...discovered, ...deriveLongContextVariants(discovered, baseUrl)];
-
-  // Gate outbound requests on what discovery actually returned, so a model
-  // this key cannot reach fails fast client-side instead of round-tripping.
-  setDiscoveredModelIds(models.map((m) => m.id.replace(/(\d)-(\d)/g, "$1.$2")));
 
   log.info("discover.ok", {
     count: models.length,

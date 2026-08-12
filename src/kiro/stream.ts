@@ -27,9 +27,14 @@ import type {
 } from "@earendil-works/pi-ai";
 import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { log, previewChunk } from "./debug.ts";
+import {
+  readResponseTextBounded,
+  sanitizeKiroError,
+  sanitizeKiroStreamEventError,
+} from "./errors.ts";
 import { parseKiroEvents } from "./event-parser.ts";
 import type { KiroModel } from "./models.ts";
-import { kiroModels, resolveKiroModel } from "./models.ts";
+import { kiroModels, toKiroModelId } from "./models.ts";
 import { ThinkingTagParser } from "./thinking-parser.ts";
 import { countTokens } from "./tokenizer.ts";
 import {
@@ -241,15 +246,24 @@ export function streamKiro(
     let hiddenThinkingIndex: number | null = null;
     let hiddenMarkerTimer: ReturnType<typeof setTimeout> | null = null;
     let hiddenMarkerEmitted = false;
+    // Assigned while consuming a response so unexpected reader failures can
+    // close that attempt's live blocks before the terminal error event.
+    let closeActiveAttempt: (() => void) | undefined;
+
+    // The Pi stream protocol has one lifecycle start for the whole logical
+    // request, not one for each transport retry.
+    stream.push({ type: "start", partial: output });
 
     try {
       const apiKey = options?.apiKey;
       if (!apiKey) {
-        throw new Error("Kiro API key not set. Set KIRO_API_KEY in your environment.");
+        throw new Error(
+          "Kiro API key not set. Run /login kiro-api-key or set KIRO_API_KEY in your environment.",
+        );
       }
 
       const endpoint = model.baseUrl || "https://q.us-east-1.amazonaws.com/";
-      const kiroModelId = resolveKiroModel(model.id);
+      const kiroModelId = toKiroModelId(model.id);
       const thinkingEnabled = !!options?.reasoning || model.reasoning;
       // Kiro models where upstream hides reasoning entirely (no `<thinking>`
       // tags in the text stream, no native reasoning event). We surface a
@@ -432,11 +446,9 @@ export function streamKiro(
         };
 
         // -- HTTP request with capacity-retry inner loop -----------------
-        // Emit `start` and the hidden-reasoning indicator *before* the
-        // fetch so the live indicator covers the server-side deliberation
-        // window (which is where the wait actually happens on reasoning
-        // models — the model reasons before sending any bytes).
-        stream.push({ type: "start", partial: output });
+        // Emit the hidden-reasoning indicator before the fetch so the live
+        // indicator covers the server-side deliberation window (which is
+        // where the wait actually happens on reasoning models).
         if (reasoningHidden && thinkingEnabled && hiddenThinkingIndex === null) {
           hiddenThinkingIndex = emitHiddenReasoningStart(output, stream);
           hiddenMarkerEmitted = false;
@@ -481,18 +493,18 @@ export function streamKiro(
               "user-agent": ua,
             },
             body: JSON.stringify(request),
+            // Do not forward an API key if a service endpoint redirects.
+            redirect: "error",
             signal: options?.signal,
           });
 
           if (response.ok) break;
 
-          let errText = "";
-          try {
-            errText = await response.text();
-          } catch {
-            errText = "";
+          const errText = await readResponseTextBounded(response).catch(() => "");
+          if (log.isUnsafeDebugPayloadEnabled()) {
+            log.debug("response.error.payload", { status: response.status, body: errText });
           }
-          log.debug("response.error", { status: response.status, body: errText });
+          const safeError = sanitizeKiroError(response.status, response.statusText, errText);
 
           if (isCapacityError(errText) && capacityRetryCount < CAPACITY_MAX_RETRIES) {
             capacityRetryCount++;
@@ -509,17 +521,17 @@ export function streamKiro(
           }
 
           if (isNonRetryableBodyError(errText) || isCapacityError(errText)) {
-            throw new Error(`Kiro API error: ${errText || response.statusText}`);
+            throw new Error(`Kiro API error: ${safeError}`);
           }
           if (isTooBigError(response.status, errText)) {
-            throw new Error(`Kiro API error: context_length_exceeded (${response.status} ${errText})`);
+            throw new Error(`Kiro API error: context_length_exceeded (${safeError})`);
           }
           if (response.status === 401 || response.status === 403) {
             throw new Error(
-              `Kiro API error: API key rejected (${response.status}) — check KIRO_API_KEY. ${errText}`,
+              `Kiro API error: API key rejected (${response.status}) — run /login kiro-api-key or check KIRO_API_KEY.`,
             );
           }
-          throw new Error(`Kiro API error: ${response.status} ${response.statusText} ${errText}`);
+          throw new Error(`Kiro API error: ${safeError}`);
         }
 
         if (capacityRetryCount > 0) {
@@ -541,15 +553,26 @@ export function streamKiro(
 
         // ThinkingTagParser is disabled for reasoningHidden models since
         // no `<thinking>` tags will ever appear in the stream.
+        // This is deliberately per transport attempt. A retry may discard
+        // only a completely invisible attempt; once a provider event has
+        // reached the caller, its content is part of the logical response.
+        let providerContentEmitted = false;
         const thinkingParser =
-          thinkingEnabled && !reasoningHidden ? new ThinkingTagParser(output, stream) : null;
+          thinkingEnabled && !reasoningHidden
+            ? new ThinkingTagParser(output, stream, () => {
+                providerContentEmitted = true;
+              })
+            : null;
         let textBlockIndex: number | null = null;
         let emittedToolCalls = 0;
         let sawAnyToolCalls = false;
         let currentToolCall: KiroToolCallState | null = null;
         const flushToolCall = () => {
           if (!currentToolCall) return;
-          if (emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
+          if (emitToolCall(currentToolCall, output, stream)) {
+            emittedToolCalls++;
+            providerContentEmitted = true;
+          }
           currentToolCall = null;
         };
 
@@ -568,6 +591,27 @@ export function streamKiro(
           }
         };
 
+        let providerBlocksClosed = false;
+        const closeOpenProviderBlocks = () => {
+          if (providerBlocksClosed) return;
+          providerBlocksClosed = true;
+          if (thinkingParser) {
+            thinkingParser.finalize();
+            textBlockIndex = thinkingParser.getTextBlockIndex();
+          }
+          if (textBlockIndex !== null) {
+            const block = output.content[textBlockIndex] as TextContent | undefined;
+            if (block) {
+              stream.push({
+                type: "text_end",
+                contentIndex: textBlockIndex,
+                content: block.text,
+                partial: output,
+              });
+            }
+          }
+        };
+
         let idleTimer: ReturnType<typeof setTimeout> | null = null;
         let idleCancelled = false;
         const resetIdle = () => {
@@ -576,6 +620,13 @@ export function streamKiro(
             idleCancelled = true;
             void reader.cancel().catch(() => {});
           }, IDLE_TIMEOUT_MS);
+        };
+        closeActiveAttempt = () => {
+          if (idleTimer) {
+            clearTimeout(idleTimer);
+            idleTimer = null;
+          }
+          closeOpenProviderBlocks();
         };
 
         let gotFirstToken = false;
@@ -620,8 +671,8 @@ export function streamKiro(
           if (done) break;
           const decoded = decoder.decode(value, { stream: true });
           buffer += decoded;
-          if (log.isDebug()) {
-            log.debug("stream.chunk", {
+          if (log.isUnsafeDebugPayloadEnabled()) {
+            log.debug("stream.chunk.payload", {
               seq: chunkSeq++,
               bytes: value?.byteLength ?? 0,
               decodedLen: decoded.length,
@@ -632,9 +683,9 @@ export function streamKiro(
           buffer = remaining;
           resetIdle();
 
-          if (log.isDebug() && events.length > 0) {
+          if (log.isUnsafeDebugPayloadEnabled() && events.length > 0) {
             for (const ev of events) {
-              log.debug("stream.event", { seq: eventSeq++, event: ev });
+              log.debug("stream.event.payload", { seq: eventSeq++, event: ev });
             }
           }
 
@@ -660,6 +711,7 @@ export function streamKiro(
                   if (textBlockIndex === null) {
                     textBlockIndex = output.content.length;
                     output.content.push({ type: "text", text: "" });
+                    providerContentEmitted = true;
                     stream.push({ type: "text_start", contentIndex: textBlockIndex, partial: output });
                   }
                   const block = output.content[textBlockIndex] as TextContent | undefined;
@@ -704,9 +756,7 @@ export function streamKiro(
                 break;
               }
               case "error": {
-                streamError = event.data.message
-                  ? `${event.data.error}: ${event.data.message}`
-                  : event.data.error;
+                streamError = sanitizeKiroStreamEventError(event.data.error, event.data.message);
                 void reader.cancel().catch(() => {});
                 break;
               }
@@ -718,24 +768,28 @@ export function streamKiro(
         if (idleTimer) clearTimeout(idleTimer);
 
         if (firstTokenTimedOut || idleCancelled || streamError) {
-          if (retryCount < MAX_RETRIES) {
+          if (!providerContentEmitted && retryCount < MAX_RETRIES) {
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
             log.warn(
               `stream ${firstTokenTimedOut ? "first-token timed out" : idleCancelled ? "idle timed out" : `error: ${streamError}`} — retrying (${retryCount}/${MAX_RETRIES})`,
             );
             await abortableDelay(delayMs, options?.signal);
-            // Close any open live indicator before the retry opens a fresh
-            // block at contentIndex 0. pi-agent-core's indexed assignment
-            // overwrites the prior block on the new thinking_start.
+            // Synthetic hidden-reasoning UI may be discarded with an
+            // otherwise invisible attempt; provider content never is.
             closeHiddenBreadcrumb();
             output.content = [];
             textBlockIndex = null;
             continue;
           }
-          if (streamError) throw new Error(`Kiro API stream error after max retries: ${streamError}`);
+          if (providerContentEmitted) closeOpenProviderBlocks();
+          if (streamError) {
+            throw new Error(
+              `Kiro API stream error${providerContentEmitted ? " after provider output" : " after max retries"}: ${streamError}`,
+            );
+          }
           throw new Error(
-            `Kiro API error: ${firstTokenTimedOut ? "first token" : "idle"} timeout after max retries`,
+            `Kiro API error: ${firstTokenTimedOut ? "first token" : "idle"} timeout${providerContentEmitted ? " after provider output" : " after max retries"}`,
           );
         }
 
@@ -779,7 +833,7 @@ export function streamKiro(
             ? (output.content[textBlockIndex] as TextContent | undefined)
             : undefined;
         const hasText = !!textBlock && textBlock.text.length > 0;
-        if (!hasText && !sawAnyToolCalls) {
+        if (!hasText && !sawAnyToolCalls && !providerContentEmitted) {
           if (retryCount < MAX_RETRIES) {
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
@@ -818,6 +872,11 @@ export function streamKiro(
         return;
       }
     } catch (error) {
+      // A rejecting reader bypasses the normal stream-finalization path.
+      // Clear its timer and balance externally visible provider blocks before
+      // exposing the terminal partial response.
+      closeActiveAttempt?.();
+      closeActiveAttempt = undefined;
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = error instanceof Error ? error.message : String(error);
       log.debug("response.caught", { stopReason: output.stopReason, error: output.errorMessage });

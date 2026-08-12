@@ -1,27 +1,16 @@
 // Vendored from pi-kiro (MIT, Copyright (c) 2026 Hongyi Lyu). See NOTICE.
 //
-// Leveled logger gated by the KIRO_LOG env var.
-//
-// Levels: error (always on) / warn (default) / info / debug.
-// Set KIRO_LOG=debug|info|warn|error to change the threshold.
-//
-// Destination: console by default. If KIRO_LOG_FILE is set, all output is
-// redirected exclusively to that file (appended, one JSON line per record)
-// so CLI stdout/stderr stays clean during capture sessions.
+// Leveled diagnostics. KIRO_LOG controls metadata verbosity. Raw service
+// payloads are never logged unless KIRO_UNSAFE_DEBUG_PAYLOADS=1 is also set.
 
-import { appendFileSync, mkdirSync } from "node:fs";
+import { closeSync, fchmodSync, lstatSync, mkdirSync, openSync, writeSync } from "node:fs";
+import { constants as fsConstants } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 export type LogLevel = "error" | "warn" | "info" | "debug";
 
 const LOG_PREFIX = "[pi-kiro-api]";
-
-const LEVEL_ORDER: Record<LogLevel, number> = {
-  error: 0,
-  warn: 1,
-  info: 2,
-  debug: 3,
-};
+const LEVEL_ORDER: Record<LogLevel, number> = { error: 0, warn: 1, info: 2, debug: 3 };
 
 function currentLevel(): LogLevel {
   const raw = (globalThis.process?.env?.KIRO_LOG ?? "").toLowerCase();
@@ -39,22 +28,48 @@ function currentFilePath(): string | null {
   return isAbsolute(raw) ? raw : resolve(process.cwd(), raw);
 }
 
-// Track which directories we've already ensured exist so we don't stat on every
-// log line. Cleared implicitly on process exit.
 const ensuredDirs = new Set<string>();
 let fileFallbackWarned = false;
 
+/** Raw stream/event payloads may contain prompts and responses; require an explicit unsafe opt-in. */
+function unsafeDebugPayloads(): boolean {
+  return globalThis.process?.env?.KIRO_UNSAFE_DEBUG_PAYLOADS === "1";
+}
+
+/** Append a log line only to a regular, non-symlink file owned by this process (0600). */
+export function writeSecureLogFile(filePath: string, line: string): void {
+  const dir = dirname(filePath);
+  if (!ensuredDirs.has(dir)) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    ensuredDirs.add(dir);
+  }
+
+  try {
+    const stat = lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error("KIRO_LOG_FILE must be a regular non-symlink file");
+    }
+  } catch (error) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
+      throw error;
+    }
+  }
+
+  const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW;
+  const fd = openSync(filePath, flags, 0o600);
+  try {
+    // Existing files may have been created under a different umask.
+    fchmodSync(fd, 0o600);
+    writeSync(fd, `${line}\n`);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function writeToFile(filePath: string, line: string): void {
   try {
-    const dir = dirname(filePath);
-    if (!ensuredDirs.has(dir)) {
-      mkdirSync(dir, { recursive: true });
-      ensuredDirs.add(dir);
-    }
-    appendFileSync(filePath, line + "\n");
+    writeSecureLogFile(filePath, line);
   } catch (err) {
-    // Fall back to stderr so the failure isn't silent, but only once per
-    // process to avoid log-loop amplification.
     if (!fileFallbackWarned) {
       fileFallbackWarned = true;
       console.error(`${LOG_PREFIX} ERROR failed to write KIRO_LOG_FILE=${filePath}:`, err);
@@ -64,20 +79,14 @@ function writeToFile(filePath: string, line: string): void {
 
 function emit(level: LogLevel, message: string, data?: unknown): void {
   if (!enabled(level)) return;
-
   const filePath = currentFilePath();
   if (filePath) {
-    const record: Record<string, unknown> = {
-      ts: new Date().toISOString(),
-      level,
-      msg: message,
-    };
+    const record: Record<string, unknown> = { ts: new Date().toISOString(), level, msg: message };
     if (data !== undefined) record.data = data;
     let line: string;
     try {
       line = JSON.stringify(record);
     } catch {
-      // Data has circular refs or non-serializable values; stringify best-effort.
       line = JSON.stringify({ ...record, data: String(data) });
     }
     writeToFile(filePath, line);
@@ -86,11 +95,8 @@ function emit(level: LogLevel, message: string, data?: unknown): void {
 
   const prefix = `${LOG_PREFIX} ${level.toUpperCase()}`;
   const sink = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
-  if (data === undefined) {
-    sink(`${prefix} ${message}`);
-  } else {
-    sink(`${prefix} ${message}`, data);
-  }
+  if (data === undefined) sink(`${prefix} ${message}`);
+  else sink(`${prefix} ${message}`, data);
 }
 
 export const log = {
@@ -98,19 +104,10 @@ export const log = {
   warn: (msg: string, data?: unknown) => emit("warn", msg, data),
   info: (msg: string, data?: unknown) => emit("info", msg, data),
   debug: (msg: string, data?: unknown) => emit("debug", msg, data),
-  /** True when the current threshold includes `debug`. Use to avoid
-   *  expensive serialization of payloads we won't log. */
   isDebug: () => enabled("debug"),
+  isUnsafeDebugPayloadEnabled: () => enabled("debug") && unsafeDebugPayloads(),
 };
 
-// ---- Debug utilities ----------------------------------------------------
-
-/**
- * Produce a short, printable preview of a raw stream chunk for debug logs.
- * Kiro's response is AWS Event Stream binary with JSON payloads; most bytes
- * are framing noise. We keep the output bounded and escape non-printable
- * chars so the log file stays greppable.
- */
 const CHUNK_PREVIEW_LIMIT = 2048;
 export function previewChunk(s: string): string {
   let out = "";

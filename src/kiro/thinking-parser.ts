@@ -49,6 +49,7 @@ export class ThinkingTagParser {
   constructor(
     private output: AssistantMessage,
     private stream: AssistantMessageEventStream,
+    private onProviderContentEmitted?: () => void,
   ) {}
 
   processChunk(chunk: string): void {
@@ -89,17 +90,28 @@ export class ThinkingTagParser {
         thinkingBlockIndex: this.thinkingBlockIndex,
       });
     }
-    if (this.textBuffer.length === 0) return;
+    if (this.textBuffer.length > 0) {
+      if (this.inThinking && this.thinkingBlockIndex !== null) {
+        const block = this.output.content[this.thinkingBlockIndex] as ThinkingContent | undefined;
+        if (block) {
+          block.thinking += this.textBuffer;
+          this.stream.push({
+            type: "thinking_delta",
+            contentIndex: this.thinkingBlockIndex,
+            delta: this.textBuffer,
+            partial: this.output,
+          });
+        }
+      } else {
+        this.emitText(this.textBuffer);
+      }
+      this.textBuffer = "";
+    }
+    // A transport failure can interrupt a thinking block after its last
+    // delta. Always balance the externally visible start in that case.
     if (this.inThinking && this.thinkingBlockIndex !== null) {
       const block = this.output.content[this.thinkingBlockIndex] as ThinkingContent | undefined;
       if (block) {
-        block.thinking += this.textBuffer;
-        this.stream.push({
-          type: "thinking_delta",
-          contentIndex: this.thinkingBlockIndex,
-          delta: this.textBuffer,
-          partial: this.output,
-        });
         this.stream.push({
           type: "thinking_end",
           contentIndex: this.thinkingBlockIndex,
@@ -107,10 +119,8 @@ export class ThinkingTagParser {
           partial: this.output,
         });
       }
-    } else {
-      this.emitText(this.textBuffer);
+      this.inThinking = false;
     }
-    this.textBuffer = "";
   }
 
   getTextBlockIndex(): number | null {
@@ -194,6 +204,7 @@ export class ThinkingTagParser {
     if (this.textBlockIndex === null) {
       this.textBlockIndex = this.output.content.length;
       this.output.content.push({ type: "text", text: "" });
+      this.onProviderContentEmitted?.();
       this.stream.push({ type: "text_start", contentIndex: this.textBlockIndex, partial: this.output });
     }
     const block = this.output.content[this.textBlockIndex] as TextContent | undefined;
@@ -220,6 +231,7 @@ export class ThinkingTagParser {
         this.thinkingBlockIndex = this.output.content.length;
         this.output.content.push({ type: "thinking", thinking: "" });
       }
+      this.onProviderContentEmitted?.();
       this.stream.push({
         type: "thinking_start",
         contentIndex: this.thinkingBlockIndex,

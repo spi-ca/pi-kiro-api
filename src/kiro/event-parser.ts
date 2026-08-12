@@ -163,7 +163,7 @@ export function parseKiroEvents(
       // No known event prefix in the remainder. If there are brace-opens
       // sitting in the gap, surface them — that's where an unrecognized
       // top-level key would live.
-      if (log.isDebug()) {
+      if (log.isUnsafeDebugPayloadEnabled()) {
         const gap = buffer.substring(pos);
         const braceIdx = gap.indexOf('{"');
         if (braceIdx >= 0) {
@@ -176,7 +176,7 @@ export function parseKiroEvents(
       break;
     }
 
-    if (log.isDebug() && jsonStart > pos) {
+    if (log.isUnsafeDebugPayloadEnabled() && jsonStart > pos) {
       // Bytes skipped between pos and the next known event — usually binary
       // framing, but worth peeking at once so we can tell.
       const skipped = buffer.substring(pos, jsonStart);
@@ -203,14 +203,14 @@ export function parseKiroEvents(
       const event = parseKiroEvent(parsed);
       if (event) {
         events.push(event);
-      } else if (log.isDebug()) {
+      } else if (log.isUnsafeDebugPayloadEnabled()) {
         // Frame parsed cleanly but didn't match any known event shape.
         // This is the primary signal for a new upstream event type.
         log.debug("event.unknown", { keys: Object.keys(parsed), raw: parsed });
       }
     } catch (err) {
       // Brace-balanced but not valid JSON — skip.
-      if (log.isDebug()) {
+      if (log.isUnsafeDebugPayloadEnabled()) {
         log.debug("event.parseFail", {
           err: err instanceof Error ? err.message : String(err),
           snippet: buffer.substring(jsonStart, Math.min(jsonEnd + 1, jsonStart + 200)),
