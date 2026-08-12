@@ -165,22 +165,19 @@ integers in string form — Pi's `ThinkingLevelMap` type is string-valued.
 Malformed entries are discarded rather than interpolated into the prompt, and a
 budget is capped at 200,000 tokens.
 
-## Prompt caching
+## Prompt caching (opt-in)
 
-A `cachePoint` marker is sent on the last completed assistant turn in history,
-which is the byte-stable prefix boundary. This is enabled by default. Set
-`KIRO_CACHE_POINTS=0` to turn it off.
+`KIRO_CACHE_POINTS=1` sends a `cachePoint` marker on the last completed
+assistant turn in history, which is the byte-stable prefix boundary. It is off
+by default.
 
-Every model in the discovered catalog accepts the marker on this API-key path —
-verified across the Claude, GPT, DeepSeek, MiniMax, GLM, and Qwen families, and
-with tool-calling history — and it never changes visible content.
+The field is accepted on this API-key path, but Kiro's response stream reports
+no cache-hit accounting: `MeteringEvent` carries a single scalar and no event
+variant breaks out cache tokens, so `usage.cacheRead` stays `0` either way.
+Measured effect on a repeated large prefix was within run-to-run noise, so
+treat this as unverified and compare time-to-first-token yourself.
 
-Kiro's response stream reports no cache-hit accounting: `MeteringEvent` carries
-a single scalar and no event variant breaks out cache tokens, so
-`usage.cacheRead` stays `0` regardless. Measured effect on a repeated large
-prefix was within run-to-run noise, so treat the benefit as unverified.
-
-Set `KIRO_LOG=info` to compare it yourself: each attempt logs
+Set `KIRO_LOG=info` to record that comparison: each attempt logs
 `stream.firstToken` with `ms`, `cachePoints`, and `historyLen`.
 
 `clientCacheConfig` is intentionally not sent. Its Smithy model carries no

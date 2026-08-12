@@ -165,7 +165,7 @@ test("closes provider blocks when the response reader rejects after partial outp
   }
 });
 
-test("cache points mark only the stable history prefix and can be disabled", async () => {
+test("cache points are opt-in and mark only the stable history prefix", async () => {
   const originalFetch = globalThis.fetch;
   const originalFlag = process.env.KIRO_CACHE_POINTS;
   const messages: Message[] = [
@@ -202,6 +202,10 @@ test("cache points mark only the stable history prefix and can be disabled", asy
 
   try {
     delete process.env.KIRO_CACHE_POINTS;
+    const disabled = await capture();
+    expect(JSON.stringify(disabled)).not.toContain("cachePoint");
+
+    process.env.KIRO_CACHE_POINTS = "1";
     const enabled = await capture();
     const history = enabled.conversationState.history as any[];
     const marked = history.filter((entry) => entry.assistantResponseMessage?.cachePoint);
@@ -209,10 +213,6 @@ test("cache points mark only the stable history prefix and can be disabled", asy
     expect(marked).toHaveLength(1);
     expect(marked[0].assistantResponseMessage.cachePoint).toEqual({ type: "default" });
     expect(enabled.conversationState.currentMessage.userInputMessage.cachePoint).toBeUndefined();
-
-    process.env.KIRO_CACHE_POINTS = "0";
-    const disabled = await capture();
-    expect(JSON.stringify(disabled)).not.toContain("cachePoint");
   } finally {
     globalThis.fetch = originalFetch;
     if (originalFlag === undefined) delete process.env.KIRO_CACHE_POINTS;

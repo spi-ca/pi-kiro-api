@@ -68,15 +68,13 @@ const MAX_RETRY_DELAY_MS = 10_000;
 const CAPACITY_MAX_RETRIES = 3;
 
 /**
- * Prompt caching is on by default: every model this provider exposes accepts
- * `cachePoint` on the API-key path, and the marker never changes visible
- * content. Kiro reports no cache-hit accounting, so `KIRO_CACHE_POINTS=0`
- * exists as an escape hatch rather than a tuning knob.
+ * Prompt caching is opt-in: Kiro accepts `cachePoint` on this API-key path,
+ * but its response stream reports no cache-hit accounting, so the only
+ * available signal is a time-to-first-token comparison.
  */
 function cachePointsEnabled(): boolean {
-  const raw = globalThis.process?.env?.KIRO_CACHE_POINTS?.trim().toLowerCase();
-  if (raw === undefined || raw === "") return true;
-  return !(raw === "0" || raw === "false" || raw === "no" || raw === "off");
+  const raw = globalThis.process?.env?.KIRO_CACHE_POINTS;
+  return raw === "1" || raw?.toLowerCase() === "true";
 }
 const CAPACITY_BASE_DELAY_MS = 5_000;
 const CAPACITY_MAX_DELAY_MS = 30_000;
