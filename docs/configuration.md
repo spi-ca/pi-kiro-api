@@ -165,20 +165,48 @@ integers in string form — Pi's `ThinkingLevelMap` type is string-valued.
 Malformed entries are discarded rather than interpolated into the prompt, and a
 budget is capped at 200,000 tokens.
 
+## Usage and cost reporting
+
+Kiro bills in credits, not per-token USD, and its stream reports no token
+counts. The footer and `/session` therefore show approximations:
+
+| Field | Source |
+|---|---|
+| `usage.input` | derived from `contextUsageEvent` percentage × context window |
+| `usage.output` | estimated at ~4 characters per token |
+| `usage.cacheRead` / `cacheWrite` | always `0`; Kiro reports no cache accounting |
+| `usage.cost` | always `0`; there is no token price to apply |
+
+The real charge arrives as a `meteringEvent` credit amount, which has no
+representation in pi's `Usage` type: every field there is tokens or currency,
+and the footer formats `cost` with a hard-coded `$`. Reporting credits as `cost`
+would render them as dollars, so cost stays `0` rather than showing a confident
+wrong number. Per-model credit rates are surfaced in the model name via
+`rateMultiplier`.
+
+For the account-level budget, ask Kiro directly — the
+`AmazonCodeWhispererService.GetUsageLimits` operation returns plan, credits
+used, and the reset date. This provider does not wrap it, to avoid adding a
+command to every request's prompt.
+
 ## Prompt caching (opt-in)
 
 `KIRO_CACHE_POINTS=1` sends a `cachePoint` marker on the last completed
 assistant turn in history, which is the byte-stable prefix boundary. It is off
 by default.
 
-The field is accepted on this API-key path, but Kiro's response stream reports
-no cache-hit accounting: `MeteringEvent` carries a single scalar and no event
-variant breaks out cache tokens, so `usage.cacheRead` stays `0` either way.
-Measured effect on a repeated large prefix was within run-to-run noise, so
-treat this as unverified and compare time-to-first-token yourself.
+The field is accepted on this API-key path, but it showed no measurable effect.
+Repeating the same large prefix returned a byte-identical `meteringEvent` credit
+charge with and without the marker. Time-to-first-token differences also stayed
+within run-to-run noise, and no event variant breaks out cache tokens, so
+`usage.cacheRead` stays `0` either way.
 
-Set `KIRO_LOG=info` to record that comparison: each attempt logs
-`stream.firstToken` with `ms`, `cachePoints`, and `historyLen`.
+It therefore stays off by default: the flag exists so the behavior can be
+re-measured if Kiro starts reporting cache accounting, not because it is known
+to help.
+
+Set `KIRO_LOG=info` to compare yourself: each attempt logs `stream.firstToken`
+with `ms`, `cachePoints`, and `historyLen`.
 
 `clientCacheConfig` is intentionally not sent. Its Smithy model carries no
 documentation, so `useClientCachingOnly` semantics are unclear.
