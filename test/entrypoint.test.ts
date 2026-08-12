@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Provider } from "@earendil-works/pi-ai";
+import { getApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import registerKiroApiKeyProvider from "../extension.ts";
 import { KIRO_PROVIDER_ID } from "../src/kiro/provider-auth.ts";
@@ -51,6 +52,30 @@ test("extension registers a native provider when no ambient key is configured", 
     );
     expect(providers[0]?.getModels()).toEqual([]);
   } finally {
+    restoreEnv("KIRO_API_KEY", oldKey);
+    restoreEnv("KIRO_API_REGION", oldRegion);
+  }
+});
+
+test("extension registers Kiro streams for compat and blackhole bridge fallbacks", async () => {
+  const oldKey = process.env.KIRO_API_KEY;
+  const oldRegion = process.env.KIRO_API_REGION;
+  const providerStreamsKey = Symbol.for("pi-blackhole:provider-streams");
+  const oldProviderStreams = (globalThis as Record<symbol, unknown>)[providerStreamsKey];
+  const providerStreams = new Map<string, Function>();
+  delete process.env.KIRO_API_KEY;
+  delete process.env.KIRO_API_REGION;
+  (globalThis as Record<symbol, unknown>)[providerStreamsKey] = providerStreams;
+  unregisterApiProviders(KIRO_PROVIDER_ID);
+  try {
+    await registerKiroApiKeyProvider({ registerProvider: () => {} } as unknown as ExtensionAPI);
+
+    expect(getApiProvider("kiro-api")?.streamSimple).toBeFunction();
+    expect(providerStreams.get("kiro-api")).toBeFunction();
+  } finally {
+    unregisterApiProviders(KIRO_PROVIDER_ID);
+    if (oldProviderStreams === undefined) delete (globalThis as Record<symbol, unknown>)[providerStreamsKey];
+    else (globalThis as Record<symbol, unknown>)[providerStreamsKey] = oldProviderStreams;
     restoreEnv("KIRO_API_KEY", oldKey);
     restoreEnv("KIRO_API_REGION", oldRegion);
   }
