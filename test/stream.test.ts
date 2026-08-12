@@ -165,6 +165,32 @@ test("closes provider blocks when the response reader rejects after partial outp
   }
 });
 
+test("identical adjacent content frames are preserved", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      '{"content":"- "}{"content":"- "}{"content":"item"}{"contextUsagePercentage":10}',
+      { status: 200 },
+    )) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      message: { content: Array<{ type: string; text?: string }> };
+    };
+
+    expect(terminal.type).toBe("done");
+    expect(terminal.message.content).toEqual([
+      expect.objectContaining({ type: "text", text: "- - item" }),
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("a literal thinking tag inside prose stays visible text", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () =>

@@ -544,7 +544,7 @@ export function streamKiro(
         const decoder = new TextDecoder();
         let buffer = "";
         let totalContent = "";
-        let lastContentData = "";
+        let sawContentEvent = false;
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
         let receivedContextUsage = false;
         let chunkSeq = 0;
@@ -697,8 +697,12 @@ export function streamKiro(
                 break;
               }
               case "content": {
-                if (event.data === lastContentData) continue;
-                lastContentData = event.data;
+                // Do not drop a frame just because it repeats the previous
+                // one. Identical adjacent frames are normal for list markers,
+                // indentation, and repeated words, so value-based dedupe
+                // silently deletes real output.
+                if (event.data === "") break;
+                sawContentEvent = true;
                 totalContent += event.data;
                 // Close the live indicator before the first real text so
                 // the breadcrumb finalizes adjacent to — not overlapping —
@@ -795,7 +799,7 @@ export function streamKiro(
         // Stream ended cleanly. If we saw any real output, close the
         // block now. If not, defer until we know whether we'll retry so
         // terminal-empty responses still close the block exactly once.
-        const gotAnyOutput = lastContentData !== "" || sawAnyToolCalls;
+        const gotAnyOutput = sawContentEvent || sawAnyToolCalls;
         if (gotAnyOutput) {
           closeHiddenBreadcrumb();
         }
