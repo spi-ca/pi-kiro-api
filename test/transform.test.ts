@@ -89,6 +89,67 @@ test("tool use ID mapping avoids collisions after sanitization", () => {
   expect(second).toMatch(/^[a-zA-Z0-9_-]+$/);
 });
 
+function assistant(content: Message["content"], stopReason: "stop" | "toolUse" = "stop"): Message {
+  return {
+    role: "assistant",
+    content,
+    api: "kiro-api",
+    provider: "kiro-api-key",
+    model: "claude-opus-5",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason,
+    timestamp: 0,
+  } as Message;
+}
+
+test("consecutive assistant turns merge to preserve Kiro alternation", () => {
+  const messages: Message[] = [
+    { role: "user", content: "go", timestamp: 0 },
+    assistant([{ type: "text", text: "first" }]),
+    assistant([{ type: "text", text: "second" }]),
+    { role: "user", content: "next", timestamp: 0 },
+  ];
+
+  const { history } = buildHistory(messages, "claude-opus-5");
+
+  expect(history).toHaveLength(2);
+  expect(history[0]?.userInputMessage).toBeDefined();
+  expect(history[1]?.assistantResponseMessage?.content).toBe("first\n\nsecond");
+});
+
+test("unanswered tool uses are closed with synthetic results", () => {
+  const messages: Message[] = [
+    { role: "user", content: "go", timestamp: 0 },
+    assistant([{ type: "toolCall", id: "call-1", name: "bash", arguments: {} }], "toolUse"),
+    { role: "user", content: "never mind", timestamp: 0 },
+    { role: "user", content: "continue", timestamp: 0 },
+  ];
+
+  const { history } = buildHistory(messages, "claude-opus-5");
+  const uses = history.flatMap((entry) => entry.assistantResponseMessage?.toolUses ?? []);
+  const results = history.flatMap(
+    (entry) => entry.userInputMessage?.userInputMessageContext?.toolResults ?? [],
+  );
+
+  expect(uses.map((use) => use.toolUseId)).toEqual(["call-1"]);
+  expect(results.map((result) => result.toolUseId)).toEqual(["call-1"]);
+  expect(results[0]?.status).toBe("error");
+
+  let previous: string | undefined;
+  for (const entry of history) {
+    const kind = entry.userInputMessage ? "user" : "assistant";
+    expect(kind).not.toBe(previous);
+    previous = kind;
+  }
+});
+
 test("content text extraction ignores thinking blocks", () => {
   expect(
     getContentText({

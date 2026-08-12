@@ -271,6 +271,20 @@ export function buildHistory(
         }
       }
       if (!armContent && armToolUses.length === 0) continue;
+      const prevEntry = history[history.length - 1];
+      if (prevEntry?.assistantResponseMessage) {
+        // Kiro strictly alternates user/assistant. Consecutive assistant turns
+        // (for example, a text-only reply followed by a tool-calling reply)
+        // must merge instead of emitting two assistant entries in a row.
+        const prevMessage = prevEntry.assistantResponseMessage;
+        prevMessage.content = prevMessage.content && armContent
+          ? `${prevMessage.content}\n\n${armContent}`
+          : prevMessage.content || armContent;
+        if (armToolUses.length > 0) {
+          prevMessage.toolUses = [...(prevMessage.toolUses ?? []), ...armToolUses];
+        }
+        continue;
+      }
       history.push({
         assistantResponseMessage: {
           content: armContent,
@@ -339,5 +353,60 @@ export function buildHistory(
     }
   }
 
+  closeUnansweredToolUses(history, modelId);
+
   return { history, systemPrepended, currentMsgStartIdx };
+}
+
+/**
+ * Kiro rejects a history whose `toolUses` have no matching `toolResults`.
+ * A session can end an assistant turn with tool calls that were aborted,
+ * errored, or truncated before their results were recorded, so close those
+ * with explicit synthetic results instead of sending an unpaired tool use.
+ */
+function closeUnansweredToolUses(history: KiroHistoryEntry[], modelId: string): void {
+  const answered = new Set<string>();
+  for (const entry of history) {
+    for (const result of entry.userInputMessage?.userInputMessageContext?.toolResults ?? []) {
+      answered.add(result.toolUseId);
+    }
+  }
+
+  for (let i = 0; i < history.length; i++) {
+    const uses = history[i]?.assistantResponseMessage?.toolUses;
+    if (!uses?.length) continue;
+    const missing = uses.filter((use) => !answered.has(use.toolUseId));
+    if (missing.length === 0) continue;
+
+    const synthetic: KiroToolResult[] = missing.map((use) => {
+      answered.add(use.toolUseId);
+      return {
+        content: [{ text: "Tool result unavailable." }],
+        status: "error",
+        toolUseId: use.toolUseId,
+      };
+    });
+
+    const next = history[i + 1];
+    if (next?.userInputMessage) {
+      if (!next.userInputMessage.userInputMessageContext) {
+        next.userInputMessage.userInputMessageContext = {};
+      }
+      next.userInputMessage.userInputMessageContext.toolResults = [
+        ...synthetic,
+        ...(next.userInputMessage.userInputMessageContext.toolResults ?? []),
+      ];
+      continue;
+    }
+
+    history.splice(i + 1, 0, {
+      userInputMessage: {
+        content: "Tool results provided.",
+        modelId,
+        origin: KIRO_ORIGIN,
+        userInputMessageContext: { toolResults: synthetic },
+      },
+    });
+    i++;
+  }
 }
