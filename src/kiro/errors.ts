@@ -38,20 +38,31 @@ function stableCode(value: unknown): string | undefined {
   return /^[A-Za-z0-9._:-]+$/.test(code) ? code.slice(0, MAX_ERROR_CODE_LENGTH) : undefined;
 }
 
+function stableType(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const fragment = value.includes("#") ? value.split("#").pop() : value;
+  return stableCode(fragment);
+}
+
 /**
  * Expose only stable, bounded diagnostics. Do not include an arbitrary raw
  * service body: it can contain request details, account data, or HTML.
  */
 export function sanitizeKiroError(status: number, _statusText: string, body: string): string {
   let code: string | undefined;
+  let reason: string | undefined;
   try {
     const parsed = JSON.parse(body) as Record<string, unknown>;
-    code = stableCode(parsed.code ?? parsed.errorCode ?? parsed.__type ?? parsed.type);
+    code = stableCode(parsed.code ?? parsed.errorCode ?? parsed.type) ?? stableType(parsed.__type);
+    reason = stableCode(parsed.reason);
   } catch {
     // A non-JSON body supplies no safe provider diagnostic.
   }
 
-  return `HTTP ${status}${code ? ` (code=${code})` : ""}`;
+  const details = [code ? `code=${code}` : undefined, reason ? `reason=${reason}` : undefined]
+    .filter(Boolean)
+    .join(", ");
+  return `HTTP ${status}${details ? ` (${details})` : ""}`;
 }
 
 /** Streaming frames expose a stable code only, never arbitrary service prose. */

@@ -11,7 +11,6 @@ import type {
   ImageContent,
   Message,
   TextContent,
-  ThinkingContent,
   Tool,
   ToolCall,
   ToolResultMessage,
@@ -75,6 +74,49 @@ export interface KiroHistoryEntry {
 // ---- Utilities ---------------------------------------------------------
 
 export const TOOL_RESULT_LIMIT = 250_000;
+const KIRO_TOOL_USE_ID_MAX_LENGTH = 64;
+const KIRO_TOOL_USE_ID_SAFE_CHARS = /[^a-zA-Z0-9_-]/g;
+
+function stableHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+function boundedToolUseId(base: string, suffix?: string): string {
+  const safeBase = base.replace(KIRO_TOOL_USE_ID_SAFE_CHARS, "_") || "tool";
+  const safeSuffix = suffix ? `_${suffix.replace(KIRO_TOOL_USE_ID_SAFE_CHARS, "_")}` : "";
+  const maxBaseLength = KIRO_TOOL_USE_ID_MAX_LENGTH - safeSuffix.length;
+  return `${safeBase.slice(0, Math.max(1, maxBaseLength))}${safeSuffix}`;
+}
+
+export class ToolUseIdMapper {
+  private readonly byOriginal = new Map<string, string>();
+  private readonly owners = new Map<string, string>();
+
+  map(id: string): string {
+    const existing = this.byOriginal.get(id);
+    if (existing) return existing;
+
+    const sanitized = id.replace(KIRO_TOOL_USE_ID_SAFE_CHARS, "_") || "tool";
+    let candidate = sanitized.length <= KIRO_TOOL_USE_ID_MAX_LENGTH
+      ? sanitized
+      : boundedToolUseId(sanitized, stableHash(id));
+
+    let collision = 0;
+    while (this.owners.has(candidate) && this.owners.get(candidate) !== id) {
+      collision++;
+      candidate = boundedToolUseId(sanitized, `${stableHash(id)}_${collision}`);
+    }
+
+    this.byOriginal.set(id, candidate);
+    this.owners.set(candidate, id);
+    return candidate;
+  }
+}
 
 /**
  * Origin tag sent on every userInputMessage. Kiro API-key auth requires the
@@ -104,7 +146,10 @@ export function getContentText(msg: Message): string {
   return msg.content
     .map((c) => {
       if (c.type === "text") return (c as TextContent).text;
-      if (c.type === "thinking") return (c as ThinkingContent).thinking;
+      // Thinking blocks are provider-internal reasoning artifacts. Replaying
+      // them into Kiro history can make cross-provider handoff requests
+      // malformed, especially when the previous provider stored signatures or
+      // UI-formatted hidden reasoning text. Preserve only user-visible text.
       return "";
     })
     .join("");
@@ -158,6 +203,7 @@ export function buildHistory(
   messages: Message[],
   modelId: string,
   systemPrompt?: string,
+  toolUseIds = new ToolUseIdMapper(),
 ): { history: KiroHistoryEntry[]; systemPrepended: boolean; currentMsgStartIdx: number } {
   const history: KiroHistoryEntry[] = [];
   let systemPrepended = false;
@@ -214,13 +260,11 @@ export function buildHistory(
         for (const block of msg.content) {
           if (block.type === "text") {
             armContent += (block as TextContent).text;
-          } else if (block.type === "thinking") {
-            armContent = `<thinking>${(block as ThinkingContent).thinking}</thinking>\n\n${armContent}`;
           } else if (block.type === "toolCall") {
             const tc = block as ToolCall;
             armToolUses.push({
               name: tc.name,
-              toolUseId: tc.id,
+              toolUseId: toolUseIds.map(tc.id),
               input: parseToolArgs(tc.arguments),
             });
           }
@@ -242,7 +286,7 @@ export function buildHistory(
       {
         content: [{ text: truncate(getContentText(msg), TOOL_RESULT_LIMIT) }],
         status: trMsg.isError ? "error" : "success",
-        toolUseId: trMsg.toolCallId,
+        toolUseId: toolUseIds.map(trMsg.toolCallId),
       },
     ];
     const trImages: ImageContent[] = [];
@@ -256,7 +300,7 @@ export function buildHistory(
       toolResults.push({
         content: [{ text: truncate(getContentText(next), TOOL_RESULT_LIMIT) }],
         status: next.isError ? "error" : "success",
-        toolUseId: next.toolCallId,
+        toolUseId: toolUseIds.map(next.toolCallId),
       });
       if (Array.isArray(next.content)) {
         for (const c of next.content) if (c.type === "image") trImages.push(c as ImageContent);

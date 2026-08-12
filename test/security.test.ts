@@ -20,6 +20,22 @@ test("sanitized errors expose only status and a stable bounded code", () => {
   expect(sanitizeKiroStreamEventError("invalid code!", serviceMessage)).toBe("code=unknown");
 });
 
+test("sanitized Kiro validation errors expose stable reason and type fragment", () => {
+  const safe = sanitizeKiroError(
+    400,
+    "Bad Request",
+    JSON.stringify({
+      __type: "com.amazon.kiro.runtimeservice#ValidationException",
+      reason: "REQUEST_BODY_INVALID",
+      message: "Invalid tool use format: call_x|fc_secret",
+    }),
+  );
+
+  expect(safe).toBe("HTTP 400 (code=ValidationException, reason=REQUEST_BODY_INVALID)");
+  expect(safe).not.toContain("call_x");
+  expect(safe).not.toContain("fc_secret");
+});
+
 test("file logging creates owner-only regular files and rejects symlinks", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-kiro-api-test-"));
   const logFile = join(dir, "kiro.log");

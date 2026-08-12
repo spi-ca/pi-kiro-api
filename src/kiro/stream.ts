@@ -45,6 +45,7 @@ import {
   extractImages,
   getContentText,
   KIRO_ORIGIN,
+  ToolUseIdMapper,
   type KiroHistoryEntry,
   type KiroImage,
   type KiroToolResult,
@@ -308,11 +309,12 @@ export function streamKiro(
         if (options?.signal?.aborted) throw options.signal.reason;
 
         const normalized = normalizeMessages(context.messages);
+        const toolUseIds = new ToolUseIdMapper();
         const {
           history,
           systemPrepended,
           currentMsgStartIdx,
-        } = buildHistory(normalized, kiroModelId, systemPrompt);
+        } = buildHistory(normalized, kiroModelId, systemPrompt, toolUseIds);
 
         const currentMessages = normalized.slice(currentMsgStartIdx);
         const firstMsg = currentMessages[0];
@@ -328,13 +330,11 @@ export function streamKiro(
             for (const b of am.content) {
               if (b.type === "text") {
                 armContent += (b as TextContent).text;
-              } else if (b.type === "thinking") {
-                armContent = `<thinking>${(b as unknown as { thinking: string }).thinking}</thinking>\n\n${armContent}`;
               } else if (b.type === "toolCall") {
                 const tc = b as ToolCall;
                 armToolUses.push({
                   name: tc.name,
-                  toolUseId: tc.id,
+                  toolUseId: toolUseIds.map(tc.id),
                   input: parseToolArgs(tc.arguments),
                 });
               }
@@ -368,7 +368,7 @@ export function streamKiro(
               currentToolResults.push({
                 content: [{ text: truncate(getContentText(m), TOOL_RESULT_LIMIT) }],
                 status: trm.isError ? "error" : "success",
-                toolUseId: trm.toolCallId,
+                toolUseId: toolUseIds.map(trm.toolCallId),
               });
               if (Array.isArray(trm.content)) {
                 for (const c of trm.content) {
@@ -390,7 +390,7 @@ export function streamKiro(
               currentToolResults.push({
                 content: [{ text: truncate(getContentText(m), TOOL_RESULT_LIMIT) }],
                 status: trm.isError ? "error" : "success",
-                toolUseId: trm.toolCallId,
+                toolUseId: toolUseIds.map(trm.toolCallId),
               });
               if (Array.isArray(trm.content)) {
                 for (const c of trm.content) {
