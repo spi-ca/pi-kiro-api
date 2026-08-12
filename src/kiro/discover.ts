@@ -13,7 +13,7 @@
 import { log } from "./debug.ts";
 import { readResponseTextBounded, sanitizeKiroError } from "./errors.ts";
 import { KIRO_ORIGIN } from "./transform.ts";
-import { kiroModels, type KiroModel } from "./models.ts";
+import { kiroModels, type KiroModel, withThinkingLevels } from "./models.ts";
 
 /**
  * Note the service prefix: the list operation lives on
@@ -61,7 +61,6 @@ const BEHAVIOR_BY_KIRO_ID: Record<string, Partial<KiroModel>> = Object.fromEntri
     },
   ]),
 );
-
 /**
  * Long-context variants are a client-side convention: the API advertises
  * e.g. `claude-sonnet-4.6` but also accepts the derived
@@ -85,7 +84,10 @@ function toKiroModel(api: ApiModel, baseUrl: string): KiroModel {
     ? ["text", "image"]
     : ["text"];
 
-  return {
+  // The thinking ladder is applied after the behavior merge, so a discovered
+  // model gets the map matching its merged `reasoningHidden` value rather
+  // than one chosen before that flag is known.
+  return withThinkingLevels({
     id: piId,
     name: api.modelName ?? piId,
     api: "kiro-api",
@@ -104,7 +106,7 @@ function toKiroModel(api: ApiModel, baseUrl: string): KiroModel {
     contextWindow: api.tokenLimits?.maxInputTokens ?? 200_000,
     maxTokens: api.tokenLimits?.maxOutputTokens ?? 8_192,
     ...BEHAVIOR_BY_KIRO_ID[api.modelId],
-  };
+  });
 }
 
 /** Build the `-1m` companions for base models the API confirmed. */
@@ -120,13 +122,15 @@ function deriveLongContextVariants(discovered: KiroModel[], baseUrl: string): Ki
     const base = discovered.find((m) => m.id === baseId);
     if (!base) continue;
 
-    out.push({
-      ...base,
-      id: staticModel.id,
-      name: `${base.name} (1M)`,
-      contextWindow: ONE_M_CONTEXT,
-      ...BEHAVIOR_BY_KIRO_ID[staticModel.id.replace(/(\d)-(\d)/g, "$1.$2")],
-    });
+    out.push(
+      withThinkingLevels({
+        ...base,
+        id: staticModel.id,
+        name: `${base.name} (1M)`,
+        contextWindow: ONE_M_CONTEXT,
+        ...BEHAVIOR_BY_KIRO_ID[staticModel.id.replace(/(\d)-(\d)/g, "$1.$2")],
+      }),
+    );
   }
   return out;
 }

@@ -59,7 +59,7 @@ CI values through a secret manager.
 
 - [Configuration and authentication](./docs/configuration.md) — `/login`,
   credential/region precedence, headless behavior, catalog cache semantics,
-  and diagnostic safety.
+  thinking-level budgets, and diagnostic safety.
 - [Development](./docs/development.md) — Bun setup, checks, packaging, and the
   non-network test strategy.
 - [Documentation index](./docs/README.md)

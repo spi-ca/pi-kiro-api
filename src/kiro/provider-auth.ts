@@ -12,6 +12,7 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { discoverKiroModels } from "./discover.ts";
 import { type KiroModel } from "./models.ts";
 import { streamKiro } from "./stream.ts";
+import { sanitizeThinkingLevelMap } from "./thinking.ts";
 
 export const KIRO_PROVIDER_ID = "kiro-api-key";
 export const DEFAULT_KIRO_REGION = "us-east-1";
@@ -94,6 +95,9 @@ function canonicalModel(model: Model<KiroApi>, endpoint: string): Model<KiroApi>
     : 200_000;
   const maxTokens = Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0 ? model.maxTokens : 8_192;
   const kiro = model as KiroModel;
+  // Sanitized rather than copied: a persisted catalog is caller-controlled
+  // input, and these values are interpolated into the system prompt.
+  const thinkingLevelMap = sanitizeThinkingLevelMap(model.thinkingLevelMap);
 
   return {
     id: model.id,
@@ -102,6 +106,7 @@ function canonicalModel(model: Model<KiroApi>, endpoint: string): Model<KiroApi>
     provider: KIRO_PROVIDER_ID,
     baseUrl: endpoint,
     reasoning: model.reasoning === true,
+    ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
     input,
     cost: ZERO_COST,
     contextWindow,
@@ -111,6 +116,25 @@ function canonicalModel(model: Model<KiroApi>, endpoint: string): Model<KiroApi>
       ? { firstTokenTimeout: kiro.firstTokenTimeout }
       : {}),
   };
+}
+
+/**
+ * Adopt the requested model's thinking ladder onto the canonical model.
+ *
+ * Requests always stream through the canonical catalog entry so a caller
+ * cannot substitute an endpoint, identity, or unlisted model ID. But Pi
+ * applies user `modelOverrides` to the model it hands us, and
+ * `thinkingLevelMap` is the one field a user is expected to tune. Adopting
+ * just that field — sanitized — keeps overrides working without widening the
+ * request boundary.
+ */
+function withRequestedThinkingLevels(
+  canonical: Model<KiroApi>,
+  requested: Model<KiroApi>,
+): Model<KiroApi> {
+  const map = sanitizeThinkingLevelMap(requested.thinkingLevelMap);
+  if (!map) return canonical;
+  return { ...canonical, thinkingLevelMap: map };
 }
 
 function buildCatalog(
@@ -320,13 +344,13 @@ export function createKiroProvider(): KiroProvider {
       const canonical = catalog.byId.get(model.id);
       if (!canonical) return unauthorizedModelStream(model);
       if (!requestMatchesCatalog(catalog, options)) return unauthorizedRequestStream(model);
-      return streamKiro(canonical, context, options);
+      return streamKiro(withRequestedThinkingLevels(canonical, model), context, options);
     },
     streamSimple(model, context, options) {
       const canonical = catalog.byId.get(model.id);
       if (!canonical) return unauthorizedModelStream(model);
       if (!requestMatchesCatalog(catalog, options)) return unauthorizedRequestStream(model);
-      return streamKiro(canonical, context, options);
+      return streamKiro(withRequestedThinkingLevels(canonical, model), context, options);
     },
     async preloadAmbientCatalog(): Promise<void> {
       if (offlineModeEnabled()) return;

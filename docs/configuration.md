@@ -107,6 +107,64 @@ Kiro also accepts a derived `-1m` long-context companion (for example,
 though that literal companion may not be returned by `ListAvailableModels`.
 No other static IDs are added.
 
+## Thinking levels
+
+Kiro's API has no reasoning parameter. The public Amazon Q Developer CLI
+Smithy client serializes exactly these `userInputMessage` keys — `content`,
+`userInputMessageContext`, `userIntent`, `origin`, `images`, `modelId`,
+`cachePoint`, `clientCacheConfig` — and `ListAvailableModels` reports no
+reasoning capability. Reasoning strength therefore travels as a
+`<max_thinking_length>` hint prepended to the system prompt, which is advisory
+rather than an enforced limit.
+
+Reasoning-capable models carry a `thinkingLevelMap` whose values are those
+token budgets:
+
+| Level | Budget |
+|-------|--------|
+| `minimal` | 4000 |
+| `low` | 10000 |
+| `medium` | 20000 |
+| `high` | 30000 |
+| `xhigh` | 50000 |
+| `max` | 64000 |
+
+Pi hides `xhigh` and `max` unless a model's map defines them, so this map is
+what makes those two levels selectable. A requested level is clamped to what
+the model's map actually exposes.
+
+The budget is not scaled against `maxTokens`. The directive is a prompt hint
+rather than an output allocation, and scaling it would collapse several rungs
+onto one value on models with a small output limit.
+
+Two behaviors are worth knowing. Selecting `off` does not disable reasoning:
+the provider still sends the directive with the 10,000-token default, because
+Kiro has no way to turn reasoning off per request. And models whose reasoning
+upstream hides (`reasoningHidden`, currently Claude Opus 4.8 and 4.7) skip the
+directive entirely, so no level changes their behavior — they mark `xhigh` and
+`max` unsupported and surface a redacted "reasoning hidden" marker instead.
+
+To change a ladder, override it per model in `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "kiro-api-key": {
+      "modelOverrides": {
+        "claude-sonnet-4-6": {
+          "thinkingLevelMap": { "xhigh": "40000", "max": null }
+        }
+      }
+    }
+  }
+}
+```
+
+A `null` hides a level; a string sets its budget. Values must be bare positive
+integers in string form — Pi's `ThinkingLevelMap` type is string-valued.
+Malformed entries are discarded rather than interpolated into the prompt, and a
+budget is capped at 200,000 tokens.
+
 ## Diagnostics and security
 
 `KIRO_LOG=error|warn|info|debug` controls diagnostic metadata (default:

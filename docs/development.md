@@ -31,6 +31,7 @@ the package's license and vendored-code attribution.
 extension.ts             Pi package entrypoint and native-provider registration
 src/kiro/provider-auth.ts native API-key login, resolution, and model refresh
 src/kiro/discover.ts     Kiro ListAvailableModels request and response mapping
+src/kiro/thinking.ts     thinking-level ladder and max_thinking_length budgets
 src/kiro/stream.ts       vendored streaming implementation
 test/                    Bun contract and unit tests
 docs/                    user and maintainer documentation

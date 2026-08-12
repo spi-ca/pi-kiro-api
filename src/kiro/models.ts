@@ -2,6 +2,7 @@
 // API-key auth. See NOTICE.
 
 import type { Model } from "@earendil-works/pi-ai";
+import { KIRO_HIDDEN_THINKING_LEVEL_MAP, KIRO_THINKING_LEVEL_MAP } from "./thinking.ts";
 
 // Kiro model catalog + ID conversion + region mapping.
 
@@ -43,7 +44,25 @@ export type KiroModel = Model<"kiro-api"> & {
   reasoningHidden?: boolean;
 };
 
-export const kiroModels: KiroModel[] = [
+/**
+ * Attach the thinking ladder that matches each model's reasoning behavior.
+ *
+ * Applied centrally rather than repeated per literal: the choice follows
+ * mechanically from `reasoning` and `reasoningHidden`, and pi will not offer
+ * `xhigh`/`max` at all unless the map defines them. An explicit map on a
+ * literal still wins, as do settings `modelOverrides`.
+ */
+export function withThinkingLevels(model: KiroModel): KiroModel {
+  if (model.thinkingLevelMap || !model.reasoning) return model;
+  return {
+    ...model,
+    thinkingLevelMap: model.reasoningHidden
+      ? KIRO_HIDDEN_THINKING_LEVEL_MAP
+      : KIRO_THINKING_LEVEL_MAP,
+  };
+}
+
+const STATIC_KIRO_MODELS: KiroModel[] = [
   {
     ...KIRO_DEFAULTS,
     id: "claude-opus-4-8",
@@ -238,3 +257,5 @@ export const kiroModels: KiroModel[] = [
     maxTokens: 65_536,
   },
 ];
+
+export const kiroModels: KiroModel[] = STATIC_KIRO_MODELS.map(withThinkingLevels);

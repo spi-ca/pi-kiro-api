@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ApiKeyCredential, ModelsStoreEntry, RefreshModelsContext } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import {
   DEFAULT_KIRO_REGION,
   KIRO_PROVIDER_ID,
@@ -570,6 +571,56 @@ describe("Kiro native provider authentication", () => {
     );
     // Discovery plus only the matching generation request.
     expect(fetchCalls).toBe(2);
+  });
+
+  test("the published catalog carries the thinking ladder", async () => {
+    const provider = createKiroProvider();
+    await withMockFetch(
+      async () => new Response(JSON.stringify(MODEL_LIST), { status: 200 }),
+      async () => provider.refreshModels?.(refreshContext()),
+    );
+
+    // Regression: canonicalization once rebuilt models field-by-field and
+    // dropped thinkingLevelMap, so Pi never offered xhigh/max.
+    for (const model of provider.getModels()) {
+      expect(model.reasoning).toBe(true);
+      const levels = getSupportedThinkingLevels(model);
+      expect(levels).toContain("xhigh");
+      expect(levels).toContain("max");
+    }
+  });
+
+  test("a caller thinking-level override reaches the request budget", async () => {
+    const provider = createKiroProvider();
+    await withMockFetch(
+      async () => new Response(JSON.stringify(MODEL_LIST), { status: 200 }),
+      async () => provider.refreshModels?.(refreshContext()),
+    );
+
+    // Pi applies settings modelOverrides to the model it hands the provider.
+    const overridden = {
+      ...provider.getModels()[0]!,
+      thinkingLevelMap: { xhigh: "40000" },
+      baseUrl: "https://evil.example/",
+    };
+
+    const bodies: string[] = [];
+    await withMockFetch(
+      async (input, init) => {
+        expect(input).toBe("https://q.eu-central-1.amazonaws.com/");
+        bodies.push(String(init?.body ?? ""));
+        return new Response(String.raw`{"content":"ok"}`, { status: 200 });
+      },
+      async () =>
+        provider.streamSimple(
+          overridden,
+          { messages: [{ role: "user", content: "hi", timestamp: Date.now() }], tools: [] },
+          { apiKey: "stored-key", env: { KIRO_API_REGION: "eu-central-1" }, reasoning: "xhigh" },
+        ).result(),
+    );
+
+    // The override budget applies, while the endpoint stays canonical.
+    expect(bodies[0]).toContain("<max_thinking_length>40000</max_thinking_length>");
   });
 
   test("stream dispatch uses the installed canonical endpoint, not caller model fields", async () => {

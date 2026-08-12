@@ -36,6 +36,7 @@ import { parseKiroEvents } from "./event-parser.ts";
 import type { KiroModel } from "./models.ts";
 import { kiroModels, toKiroModelId } from "./models.ts";
 import { ThinkingTagParser } from "./thinking-parser.ts";
+import { resolveThinkingBudget, resolveThinkingLevel } from "./thinking.ts";
 import { countTokens } from "./tokenizer.ts";
 import {
   buildHistory,
@@ -264,6 +265,10 @@ export function streamKiro(
 
       const endpoint = model.baseUrl || "https://q.us-east-1.amazonaws.com/";
       const kiroModelId = toKiroModelId(model.id);
+      // pi hands a session thinking level here, or undefined when thinking is
+      // off. Clamp it against the model's own ladder so a level the model
+      // marks unsupported cannot pick a budget the UI never offered.
+      const thinkingLevel = resolveThinkingLevel(model, options?.reasoning);
       const thinkingEnabled = !!options?.reasoning || model.reasoning;
       // Kiro models where upstream hides reasoning entirely (no `<thinking>`
       // tags in the text stream, no native reasoning event). We surface a
@@ -277,6 +282,7 @@ export function streamKiro(
         kiroModelId,
         contextWindow: model.contextWindow,
         thinkingEnabled,
+        thinkingLevel,
         reasoningHidden,
         reasoning: options?.reasoning,
         messageCount: context.messages.length,
@@ -289,14 +295,7 @@ export function streamKiro(
       // Skip the `<thinking_mode>` directive when the provider hides
       // reasoning — the directive is a no-op there and costs prompt tokens.
       if (thinkingEnabled && !reasoningHidden) {
-        const budget =
-          options?.reasoning === "xhigh"
-            ? 50000
-            : options?.reasoning === "high"
-              ? 30000
-              : options?.reasoning === "medium"
-                ? 20000
-                : 10000;
+        const budget = resolveThinkingBudget(model, options?.reasoning);
         systemPrompt = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>${
           systemPrompt ? `\n${systemPrompt}` : ""
         }`;
