@@ -29,14 +29,6 @@ function trailingPrefixLength(text: string, tag: string): number {
   return 0;
 }
 
-function maxTrailingPrefixLength(text: string, tags: string[]): number {
-  let max = 0;
-  for (const tag of tags) {
-    max = Math.max(max, trailingPrefixLength(text, tag));
-  }
-  return max;
-}
-
 export class ThinkingTagParser {
   private textBuffer = "";
   private inThinking = false;
@@ -128,35 +120,34 @@ export class ThinkingTagParser {
   }
 
   private processBeforeThinking(): void {
-    let bestPos = -1;
+    // Kiro emits reasoning only as a leading block. Scanning the whole buffer
+    // would let a literal tag inside normal prose (for example, docs or a
+    // support answer quoting `<thinking>`) hijack the rest of the response
+    // into a thinking block that never closes.
     let bestVariant: (typeof THINKING_TAG_VARIANTS)[number] | null = null;
     for (const variant of THINKING_TAG_VARIANTS) {
-      const pos = this.textBuffer.indexOf(variant.open);
-      if (pos !== -1 && (bestPos === -1 || pos < bestPos)) {
-        bestPos = pos;
+      if (this.textBuffer.startsWith(variant.open)) {
         bestVariant = variant;
+        break;
       }
     }
-    if (bestPos !== -1 && bestVariant) {
+    if (bestVariant) {
       if (log.isDebug()) {
-        log.debug("thinking.open", { tag: bestVariant.open, at: bestPos });
+        log.debug("thinking.open", { tag: bestVariant.open, at: 0 });
       }
-      if (bestPos > 0) this.emitText(this.textBuffer.slice(0, bestPos));
-      this.textBuffer = this.textBuffer.slice(bestPos + bestVariant.open.length);
+      this.textBuffer = this.textBuffer.slice(bestVariant.open.length);
       this.activeEndTag = bestVariant.close;
       this.inThinking = true;
       return;
     }
 
-    const trailing = maxTrailingPrefixLength(
-      this.textBuffer,
-      THINKING_TAG_VARIANTS.map((v) => v.open),
-    );
-    const safeLen = this.textBuffer.length - trailing;
-    if (safeLen > 0) {
-      this.emitText(this.textBuffer.slice(0, safeLen));
-      this.textBuffer = this.textBuffer.slice(safeLen);
-    }
+    const openTags = THINKING_TAG_VARIANTS.map((v) => v.open);
+    // Still buffer a partial leading tag split across chunks, but only while
+    // the buffer could become one.
+    if (openTags.some((tag) => tag.startsWith(this.textBuffer))) return;
+
+    this.thinkingExtracted = true;
+    this.processAfterThinking();
   }
 
   private processInsideThinking(): void {

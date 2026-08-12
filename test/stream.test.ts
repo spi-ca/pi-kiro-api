@@ -165,6 +165,36 @@ test("closes provider blocks when the response reader rejects after partial outp
   }
 });
 
+test("a literal thinking tag inside prose stays visible text", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        content:
+          "Kiro replays reasoning as <thinking>...</thinking> in the stream, so quoting it must stay text.",
+      }),
+      { status: 200 },
+    )) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key", reasoning: "low" })),
+    );
+
+    expect(events.filter((event) => event.type === "thinking_start")).toHaveLength(0);
+    expect(events.at(-1)?.type).toBe("done");
+    const terminal = events.at(-1) as unknown as { message: { content: Array<{ type: string; text?: string }> } };
+    expect(terminal.message.content).toEqual([
+      expect.objectContaining({
+        type: "text",
+        text: "Kiro replays reasoning as <thinking>...</thinking> in the stream, so quoting it must stay text.",
+      }),
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("sanitizes cross-provider history before sending Kiro request body", async () => {
   const originalFetch = globalThis.fetch;
   const codexToolCallId =
