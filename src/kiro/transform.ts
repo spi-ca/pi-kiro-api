@@ -53,17 +53,22 @@ export interface KiroToolSpec {
   };
 }
 
+/** Kiro's only documented cache checkpoint marker. */
+export type KiroCachePoint = { type: "default" };
+
 export interface KiroUserInputMessage {
   content: string;
   modelId: string;
   origin: string;
   images?: KiroImage[];
   userInputMessageContext?: { toolResults?: KiroToolResult[]; tools?: KiroToolSpec[] };
+  cachePoint?: KiroCachePoint;
 }
 
 export interface KiroAssistantResponseMessage {
   content: string;
   toolUses?: KiroToolUse[];
+  cachePoint?: KiroCachePoint;
 }
 
 export interface KiroHistoryEntry {
@@ -356,6 +361,23 @@ export function buildHistory(
   closeUnansweredToolUses(history, modelId);
 
   return { history, systemPrepended, currentMsgStartIdx };
+}
+
+/**
+ * Mark the stable prefix boundary of a history so Kiro can reuse it.
+ *
+ * Only the last completed assistant turn is marked: everything before it is
+ * byte-stable across turns, while the trailing entries change every request.
+ * `ListAvailableModels` and the response stream report no cache accounting, so
+ * this stays opt-in and must never change visible content.
+ */
+export function applyCachePoints(history: KiroHistoryEntry[]): void {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const assistant = history[i]?.assistantResponseMessage;
+    if (!assistant) continue;
+    assistant.cachePoint = { type: "default" };
+    return;
+  }
 }
 
 /**

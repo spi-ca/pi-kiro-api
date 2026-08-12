@@ -46,6 +46,7 @@ import {
   getContentText,
   KIRO_ORIGIN,
   ToolUseIdMapper,
+  applyCachePoints,
   type KiroHistoryEntry,
   type KiroImage,
   type KiroToolResult,
@@ -65,6 +66,16 @@ const MAX_RETRIES = 3;
 const MAX_RETRY_DELAY_MS = 10_000;
 
 const CAPACITY_MAX_RETRIES = 3;
+
+/**
+ * Prompt caching is opt-in: Kiro accepts `cachePoint` on this API-key path,
+ * but its response stream reports no cache-hit accounting, so the only
+ * available signal is a time-to-first-token comparison.
+ */
+function cachePointsEnabled(): boolean {
+  const raw = globalThis.process?.env?.KIRO_CACHE_POINTS;
+  return raw === "1" || raw?.toLowerCase() === "true";
+}
 const CAPACITY_BASE_DELAY_MS = 5_000;
 const CAPACITY_MAX_DELAY_MS = 30_000;
 
@@ -315,6 +326,8 @@ export function streamKiro(
           systemPrepended,
           currentMsgStartIdx,
         } = buildHistory(normalized, kiroModelId, systemPrompt, toolUseIds);
+        const useCachePoints = cachePointsEnabled();
+        if (useCachePoints) applyCachePoints(history);
 
         const currentMessages = normalized.slice(currentMsgStartIdx);
         const firstMsg = currentMessages[0];
@@ -631,6 +644,7 @@ export function streamKiro(
         let gotFirstToken = false;
         let firstTokenTimedOut = false;
         let streamError: string | null = null;
+        const attemptStartedAt = Date.now();
         const FIRST_TOKEN_SENTINEL = Symbol("firstTokenTimeout");
         type ReadResult = { done: boolean; value?: Uint8Array };
 
@@ -661,6 +675,13 @@ export function streamKiro(
             }
             readResult = result as ReadResult;
             gotFirstToken = true;
+            // Cache effectiveness has no wire accounting, so log TTFT to make
+            // an opt-in comparison measurable.
+            log.info("stream.firstToken", {
+              ms: Date.now() - attemptStartedAt,
+              cachePoints: useCachePoints,
+              historyLen: history.length,
+            });
             resetIdle();
           } else {
             readResult = (await reader.read()) as ReadResult;

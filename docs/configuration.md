@@ -165,6 +165,24 @@ integers in string form — Pi's `ThinkingLevelMap` type is string-valued.
 Malformed entries are discarded rather than interpolated into the prompt, and a
 budget is capped at 200,000 tokens.
 
+## Prompt caching (opt-in)
+
+`KIRO_CACHE_POINTS=1` sends a `cachePoint` marker on the last completed
+assistant turn in history, which is the byte-stable prefix boundary. It is off
+by default.
+
+The field is accepted on this API-key path, but Kiro's response stream reports
+no cache-hit accounting: `MeteringEvent` carries a single scalar and no event
+variant breaks out cache tokens, so `usage.cacheRead` stays `0` either way.
+Measured effect on a repeated large prefix was within run-to-run noise, so
+treat this as unverified and compare time-to-first-token yourself.
+
+Set `KIRO_LOG=info` to record that comparison: each attempt logs
+`stream.firstToken` with `ms`, `cachePoints`, and `historyLen`.
+
+`clientCacheConfig` is intentionally not sent. Its Smithy model carries no
+documentation, so `useClientCachingOnly` semantics are unclear.
+
 ## Diagnostics and security
 
 `KIRO_LOG=error|warn|info|debug` controls diagnostic metadata (default:
