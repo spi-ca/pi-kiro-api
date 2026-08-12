@@ -23,8 +23,14 @@ const THINKING_TAG_VARIANTS: Array<{ open: string; close: string }> = [
 /** Longest suffix of `text` that matches a prefix of `tag`. */
 function trailingPrefixLength(text: string, tag: string): number {
   const max = Math.min(text.length, tag.length - 1);
-  for (let len = max; len > 0; len--) {
-    if (text.endsWith(tag.slice(0, len))) return len;
+  // Compare in place. Building `tag.slice(0, len)` per candidate length made
+  // this the dominant per-chunk cost while streaming a long thinking block.
+  outer: for (let len = max; len > 0; len--) {
+    const offset = text.length - len;
+    for (let i = 0; i < len; i++) {
+      if (text.charCodeAt(offset + i) !== tag.charCodeAt(i)) continue outer;
+    }
+    return len;
   }
   return 0;
 }
