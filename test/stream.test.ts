@@ -700,6 +700,50 @@ test("does not retry a malformed tool call behind a stream error", async () => {
   }
 });
 
+test("keeps the tool call reason when the reader fails afterwards", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  // A later transport failure must not replace an already-detected unusable
+  // tool call: that would hide the dropped action all over again.
+  globalThis.fetch = (async () => {
+    let reads = 0;
+    return {
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: async () => {
+            reads++;
+            if (reads === 1) {
+              return {
+                done: false,
+                value: encoder.encode('{"name":"lookup","toolUseId":"c1","input":"{bad","stop":true}'),
+              };
+            }
+            throw new Error("reader exploded");
+          },
+          cancel: async () => {},
+        }),
+      },
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      error: { errorMessage: string };
+    };
+
+    expect(terminal.type).toBe("error");
+    expect(terminal.error.errorMessage).toContain("unusable JSON arguments");
+    expect(terminal.error.errorMessage).not.toContain("reader exploded");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("accepts empty tool call arguments as an empty object", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () =>

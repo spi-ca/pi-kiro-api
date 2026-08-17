@@ -611,6 +611,11 @@ export function streamKiro(
           const failure = emitToolCall(currentToolCall, output, stream);
           if (failure) {
             toolCallError ??= failure;
+            // Stop reading. The turn has already failed, and any later
+            // transport outcome — a reader rejection, a timeout, an overflow —
+            // would otherwise replace this reason with its own and hide the
+            // dropped action again.
+            void reader.cancel().catch(() => {});
           } else {
             emittedToolCalls++;
             providerContentEmitted = true;
@@ -839,8 +844,9 @@ export function streamKiro(
                 break;
               }
             }
-            if (streamError) break;
+            if (streamError || toolCallError) break;
           }
+          if (toolCallError) break;
         }
 
         if (idleTimer) clearTimeout(idleTimer);
