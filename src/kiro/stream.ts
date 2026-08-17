@@ -29,6 +29,7 @@ import { calculateCost, createAssistantMessageEventStream } from "@earendil-work
 import { log, previewChunk } from "./debug.ts";
 import {
   readResponseTextBounded,
+  safeIdentifier,
   sanitizeKiroError,
   sanitizeKiroStreamEventError,
 } from "./errors.ts";
@@ -200,21 +201,47 @@ interface KiroToolCallState {
   input: string;
 }
 
+/**
+ * Emit a completed tool call, or return the reason it could not be emitted.
+ *
+ * Returns `null` on success and a short, payload-free reason on failure. A
+ * malformed tool call must not be swallowed: the model asked to act, and
+ * reporting `stop` instead would tell the caller the turn finished normally.
+ */
 function emitToolCall(
   state: KiroToolCallState,
   output: AssistantMessage,
   stream: AssistantMessageEventStream,
-): boolean {
+): string | null {
   if (!state.input.trim()) state.input = "{}";
 
   let args: Record<string, unknown>;
   try {
-    args = JSON.parse(state.input) as Record<string, unknown>;
+    const parsed = JSON.parse(state.input) as unknown;
+    // Valid JSON is not enough: pi's ToolCall.arguments is a record, and
+    // `null`, arrays, strings, and numbers all parse cleanly. Passing one
+    // through would hand the tool-execution layer a shape it cannot use.
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("tool arguments must be a JSON object");
+    }
+    args = parsed as Record<string, unknown>;
   } catch (e) {
-    log.warn(
-      `failed to parse tool input for "${state.name}" (${state.toolUseId}): ${e instanceof Error ? e.message : String(e)}`,
-    );
-    return false;
+    // The parse exception text can quote the offending input, so it stays
+    // behind the unsafe-payload gate like every other raw payload.
+    if (log.isUnsafeDebugPayloadEnabled()) {
+      log.debug("toolcall.parse.payload", {
+        toolUseId: state.toolUseId,
+        name: state.name,
+        input: state.input,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    // The tool name and ID come off the wire, so they are rendered through the
+    // identifier allowlist. Echoing them raw would let a response forge a log
+    // line or emit terminal escapes through this message.
+    const reason = `tool "${safeIdentifier(state.name)}" returned unusable JSON arguments`;
+    log.warn(`${reason} (${safeIdentifier(state.toolUseId)})`);
+    return reason;
   }
 
   const contentIndex = output.content.length;
@@ -223,7 +250,7 @@ function emitToolCall(
   stream.push({ type: "toolcall_start", contentIndex, partial: output });
   stream.push({ type: "toolcall_delta", contentIndex, delta: state.input, partial: output });
   stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
-  return true;
+  return null;
 }
 
 // ---- Main entry --------------------------------------------------------
@@ -579,9 +606,21 @@ export function streamKiro(
         let emittedToolCalls = 0;
         let sawAnyToolCalls = false;
         let currentToolCall: KiroToolCallState | null = null;
+        // A tool call the model intended but whose arguments could not be
+        // parsed. Recorded rather than dropped so the turn fails loudly
+        // instead of reporting a normal stop with a missing action.
+        let toolCallError: string | null = null;
         const flushToolCall = () => {
           if (!currentToolCall) return;
-          if (emitToolCall(currentToolCall, output, stream)) {
+          const failure = emitToolCall(currentToolCall, output, stream);
+          if (failure) {
+            toolCallError ??= failure;
+            // Stop reading. The turn has already failed, and any later
+            // transport outcome — a reader rejection, a timeout, an overflow —
+            // would otherwise replace this reason with its own and hide the
+            // dropped action again.
+            void reader.cancel().catch(() => {});
+          } else {
             emittedToolCalls++;
             providerContentEmitted = true;
           }
@@ -641,10 +680,20 @@ export function streamKiro(
           closeOpenProviderBlocks();
         };
 
+        // "First token" means the first *parsed event*, not the first bytes
+        // off the socket. Kiro wraps its JSON events in an AWS Event Stream
+        // envelope, so a stalled response can deliver framing bytes that
+        // contain no event. Treating those as a first token would retire the
+        // first-token guard and leave the request waiting for the much longer
+        // idle timeout.
+        //
+        // The deadline is absolute per attempt so that repeated framing-only
+        // chunks cannot extend the budget by re-arming a fresh timer.
         let gotFirstToken = false;
         let firstTokenTimedOut = false;
         let streamError: string | null = null;
         const attemptStartedAt = Date.now();
+        const firstTokenDeadline = attemptStartedAt + firstTokenTimeoutForModel(model.id);
         const FIRST_TOKEN_SENTINEL = Symbol("firstTokenTimeout");
         type ReadResult = { done: boolean; value?: Uint8Array };
 
@@ -653,13 +702,11 @@ export function streamKiro(
           if (!gotFirstToken) {
             const readPromise = reader.read() as Promise<ReadResult>;
             let firstTokenTimer: ReturnType<typeof setTimeout> | null = null;
+            const remainingMs = Math.max(0, firstTokenDeadline - Date.now());
             const result = await Promise.race([
               readPromise,
               new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
-                firstTokenTimer = setTimeout(
-                  () => resolve(FIRST_TOKEN_SENTINEL),
-                  firstTokenTimeoutForModel(model.id),
-                );
+                firstTokenTimer = setTimeout(() => resolve(FIRST_TOKEN_SENTINEL), remainingMs);
               }),
             ]);
             // Always clear the timer — otherwise the happy path keeps the
@@ -674,15 +721,6 @@ export function streamKiro(
               break;
             }
             readResult = result as ReadResult;
-            gotFirstToken = true;
-            // Cache effectiveness has no wire accounting, so log TTFT to make
-            // an opt-in comparison measurable.
-            log.info("stream.firstToken", {
-              ms: Date.now() - attemptStartedAt,
-              cachePoints: useCachePoints,
-              historyLen: history.length,
-            });
-            resetIdle();
           } else {
             readResult = (await reader.read()) as ReadResult;
           }
@@ -702,6 +740,17 @@ export function streamKiro(
           const { events, remaining } = parseKiroEvents(buffer);
           buffer = remaining;
           resetIdle();
+
+          if (!gotFirstToken && events.length > 0) {
+            gotFirstToken = true;
+            // Cache effectiveness has no wire accounting, so log TTFT to make
+            // an opt-in comparison measurable.
+            log.info("stream.firstToken", {
+              ms: Date.now() - attemptStartedAt,
+              cachePoints: useCachePoints,
+              historyLen: history.length,
+            });
+          }
 
           if (log.isUnsafeDebugPayloadEnabled() && events.length > 0) {
             for (const ev of events) {
@@ -784,12 +833,36 @@ export function streamKiro(
                 void reader.cancel().catch(() => {});
                 break;
               }
+              case "followupPrompt": {
+                // Kiro suggests a follow-up question for its own chat UI.
+                // pi's AssistantMessage has no field for suggested prompts,
+                // and injecting it as text would put words in the model's
+                // mouth. Drop it deliberately rather than implicitly.
+                break;
+              }
+              default: {
+                // Exhaustiveness guard: a new KiroStreamEvent variant must be
+                // handled or explicitly ignored above, not silently dropped.
+                const unhandled: never = event;
+                void unhandled;
+                break;
+              }
             }
-            if (streamError) break;
+            if (streamError || toolCallError) break;
           }
+          if (toolCallError) break;
         }
 
         if (idleTimer) clearTimeout(idleTimer);
+
+        // A malformed tool call is a property of the response, not of the
+        // transport, so it is decided before any retry. Retrying would let a
+        // clean second attempt report `stop` while the dropped action from the
+        // first attempt goes unmentioned.
+        if (toolCallError) {
+          closeOpenProviderBlocks();
+          throw new Error(`Kiro API error: ${toolCallError}`);
+        }
 
         if (firstTokenTimedOut || idleCancelled || streamError) {
           if (!providerContentEmitted && retryCount < MAX_RETRIES) {
@@ -825,23 +898,18 @@ export function streamKiro(
           closeHiddenBreadcrumb();
         }
 
-        if (currentToolCall && emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
-        if (thinkingParser) {
-          thinkingParser.finalize();
-          textBlockIndex = thinkingParser.getTextBlockIndex();
-        }
+        flushToolCall();
+        // Same finalize-and-close-text sequence as the error paths, routed
+        // through the shared helper so its idempotence flag is set. Closing it
+        // inline here would let a later closeActiveAttempt() emit a second
+        // text_end for the same block.
+        closeOpenProviderBlocks();
 
-        if (textBlockIndex !== null) {
-          const block = output.content[textBlockIndex] as TextContent | undefined;
-          if (block) {
-            stream.push({
-              type: "text_end",
-              contentIndex: textBlockIndex,
-              content: block.text,
-              partial: output,
-            });
-          }
-        }
+        // The trailing flushToolCall() above can be the first to see a
+        // malformed call, so this is checked again after the pre-retry gate.
+        // Not retried: the caller is told the turn failed rather than
+        // receiving a `stop` that hides a dropped action.
+        if (toolCallError) throw new Error(`Kiro API error: ${toolCallError}`);
 
         if (usageEvent?.inputTokens !== undefined) output.usage.input = usageEvent.inputTokens;
         output.usage.output = usageEvent?.outputTokens ?? countTokens(totalContent);

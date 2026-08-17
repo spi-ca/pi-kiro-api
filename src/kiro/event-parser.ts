@@ -151,6 +151,44 @@ function findNextEventStart(buffer: string, from: number): number {
   return earliest;
 }
 
+/** Longest event prefix, so a split prefix can never be longer than this. */
+const MAX_PATTERN_LENGTH = Math.max(...EVENT_PATTERNS.map((p) => p.length));
+
+/**
+ * Cap on retained characters for an event that has not closed yet.
+ *
+ * This is a memory bound, not a protocol limit: nothing in Kiro's wire format
+ * states a maximum frame size. It is set far above any observed frame so that
+ * hitting it means the response is not producing closable events. Exceeding it
+ * is reported to the caller rather than discarded, since dropping the buffer
+ * would silently truncate output or trigger an empty-response retry.
+ */
+const MAX_RETAINED_BYTES = 1_048_576;
+
+/** Raised when an unterminated event grows past {@link MAX_RETAINED_BYTES}. */
+export class KiroEventBufferOverflowError extends Error {
+  constructor(readonly retainedBytes: number) {
+    super(
+      `unterminated Kiro stream event exceeded ${MAX_RETAINED_BYTES} characters (retained ${retainedBytes})`,
+    );
+    this.name = "KiroEventBufferOverflowError";
+  }
+}
+
+/**
+ * Length of the tail to keep when no event prefix is present.
+ *
+ * A prefix can straddle a chunk boundary (`{\"cont` + `ent\":...`), so dropping
+ * the whole remainder would lose the event. Keeping the last
+ * `MAX_PATTERN_LENGTH - 1` characters is enough to complete any prefix on the
+ * next chunk while still discarding framing noise.
+ */
+function tailForSplitPrefix(buffer: string, from: number): string {
+  const gap = buffer.substring(from);
+  if (gap.length <= MAX_PATTERN_LENGTH - 1) return gap;
+  return gap.substring(gap.length - (MAX_PATTERN_LENGTH - 1));
+}
+
 export function parseKiroEvents(
   buffer: string,
 ): { events: KiroStreamEvent[]; remaining: string } {
@@ -173,7 +211,9 @@ export function parseKiroEvents(
           });
         }
       }
-      break;
+      // Keep only enough of the tail to complete a prefix split across the
+      // chunk boundary; the rest is framing noise.
+      return { events, remaining: tailForSplitPrefix(buffer, pos) };
     }
 
     if (log.isUnsafeDebugPayloadEnabled() && jsonStart > pos) {
@@ -191,8 +231,15 @@ export function parseKiroEvents(
 
     const jsonEnd = findJsonEnd(buffer, jsonStart);
     if (jsonEnd < 0) {
-      // Incomplete JSON at end of buffer — preserve for next call.
-      return { events, remaining: buffer.substring(jsonStart) };
+      // Incomplete JSON at end of buffer — preserve for next call, unless it
+      // has grown past the memory bound. Any events already parsed from this
+      // buffer are lost with the throw, but they would be an incomplete
+      // response either way; failing loudly beats a silent truncation.
+      const retained = buffer.substring(jsonStart);
+      if (retained.length > MAX_RETAINED_BYTES) {
+        throw new KiroEventBufferOverflowError(retained.length);
+      }
+      return { events, remaining: retained };
     }
 
     try {

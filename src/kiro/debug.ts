@@ -3,7 +3,7 @@
 // Leveled diagnostics. KIRO_LOG controls metadata verbosity. Raw service
 // payloads are never logged unless KIRO_UNSAFE_DEBUG_PAYLOADS=1 is also set.
 
-import { closeSync, fchmodSync, lstatSync, mkdirSync, openSync, writeSync } from "node:fs";
+import { closeSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, writeSync } from "node:fs";
 import { constants as fsConstants } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
@@ -44,6 +44,9 @@ export function writeSecureLogFile(filePath: string, line: string): void {
     ensuredDirs.add(dir);
   }
 
+  // Cheap pre-open rejection. It cannot be authoritative — the path may be
+  // replaced between this call and the open — so the descriptor is validated
+  // again below.
   try {
     const stat = lstatSync(filePath);
     if (!stat.isFile() || stat.isSymbolicLink()) {
@@ -55,9 +58,29 @@ export function writeSecureLogFile(filePath: string, line: string): void {
     }
   }
 
-  const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW;
+  // O_NONBLOCK keeps a FIFO left at this path from blocking the open until a
+  // reader attaches; it has no effect on regular files.
+  const flags =
+    fsConstants.O_WRONLY |
+    fsConstants.O_APPEND |
+    fsConstants.O_CREAT |
+    fsConstants.O_NOFOLLOW |
+    (fsConstants.O_NONBLOCK ?? 0);
   const fd = openSync(filePath, flags, 0o600);
   try {
+    // Authoritative checks against the opened descriptor, not the path, so a
+    // swap after the pre-check cannot redirect the write.
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      throw new Error("KIRO_LOG_FILE must be a regular non-symlink file");
+    }
+    // A file pre-created by another user in a shared directory would otherwise
+    // receive diagnostics while its owner keeps read access. Forcing mode 0600
+    // does not help: ownership, not the mode, decides who can read it.
+    const euid = globalThis.process?.geteuid?.();
+    if (euid !== undefined && stat.uid !== euid) {
+      throw new Error("KIRO_LOG_FILE must be owned by the current user");
+    }
     // Existing files may have been created under a different umask.
     fchmodSync(fd, 0o600);
     writeSync(fd, `${line}\n`);

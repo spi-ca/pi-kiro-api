@@ -61,13 +61,16 @@ For native provider credential resolution, a stored provider credential in
 Blank values are ignored. A key can be valid only in its issued region; a
 region mismatch commonly yields an access-denied discovery error.
 
-### `--api-key` limitation in Pi 0.84.1
+### `--api-key` limitation
 
 Do not use Pi's `--api-key` as first-time configuration for this dynamic
-provider. In Pi 0.84.1 it cannot bootstrap `ListAvailableModels` before the
-provider is registered, so `--api-key` alone does not produce an initial Kiro
-catalog. Use `/login kiro-api-key` (recommended) or set `KIRO_API_KEY` before
-Pi starts.
+provider. It cannot bootstrap `ListAvailableModels` before the provider is
+registered, so `--api-key` alone does not produce an initial Kiro catalog. Use
+`/login kiro-api-key` (recommended) or set `KIRO_API_KEY` before Pi starts.
+
+This holds for 0.84.1 through 0.84.2. Pi 0.84.2 changed nothing in dynamic
+provider registration or native credential resolution, so the constraint is
+unchanged rather than fixed.
 
 A runtime `--api-key` may happen to work only when Pi already has a persisted
 catalog matching that exact key and region. It is not a supported bootstrap
@@ -102,10 +105,25 @@ new lookup, and a failed lookup remains empty for that new scope. The old
 persisted entry is not deleted preemptively, but its digest prevents it from
 being reused by the new scope.
 
-Kiro also accepts a derived `-1m` long-context companion (for example,
-`claude-sonnet-4.6-1m`) when its discovered base model is available, even
-though that literal companion may not be returned by `ListAvailableModels`.
-No other static IDs are added.
+### Long-context `-1m` companions
+
+Two ID forms are in play. Kiro's wire IDs use dots (`claude-sonnet-4.6`);
+Pi exposes the dashed form (`claude-sonnet-4-6`). Everything you type — `/model`
+selection and `modelOverrides` keys in `models.json` — uses the **dashed Pi
+form**.
+
+Kiro accepts a derived `-1m` long-context companion even though
+`ListAvailableModels` does not return it. A companion is added only when both
+of these hold:
+
+1. It appears in this provider's static catalog (`src/kiro/models.ts`), and
+2. discovery confirmed its base model for the active key.
+
+The currently derivable companions are `claude-opus-4-6-1m`,
+`claude-sonnet-4-6-1m`, `claude-sonnet-4-5-1m`, and `agi-nova-beta-1m`. A `-1m`
+suffix is not synthesized for arbitrary discovered models, and no other static
+IDs are added — the entitlement boundary from `ListAvailableModels` is
+otherwise preserved exactly.
 
 ## Thinking levels
 
@@ -116,6 +134,14 @@ Smithy client serializes exactly these `userInputMessage` keys — `content`,
 reasoning capability. Reasoning strength therefore travels as a
 `<max_thinking_length>` hint prepended to the system prompt, which is advisory
 rather than an enforced limit.
+
+Since `ListAvailableModels` reports nothing about reasoning, a discovered model
+defaults to reasoning-capable. Models known not to reason are corrected from
+this provider's static catalog: `claude-haiku-4-5`, `minimax-m2-5`,
+`minimax-m2-1`, and `glm-4-7-flash` get no thinking directive and no level
+ladder. A model absent from that catalog keeps the reasoning-capable default,
+since an unnecessary directive costs less than suppressing reasoning on a model
+that supports it.
 
 Reasoning-capable models carry a `thinkingLevelMap` whose values are those
 token budgets:
@@ -167,22 +193,30 @@ budget is capped at 200,000 tokens.
 
 ## Usage and cost reporting
 
-Kiro bills in credits, not per-token USD, and its stream reports no token
-counts. The footer and `/session` therefore show approximations:
+Kiro bills in credits, not per-token USD, and its stream normally reports no
+token counts. The footer and `/session` therefore usually show
+approximations:
 
 | Field | Source |
 |---|---|
-| `usage.input` | derived from `contextUsageEvent` percentage × context window |
-| `usage.output` | estimated at ~4 characters per token |
+| `usage.input` | a `usage` event's `inputTokens` when present, otherwise derived from `contextUsageEvent` percentage × context window |
+| `usage.output` | a `usage` event's `outputTokens` when present, otherwise estimated at ~4 characters per token |
 | `usage.cacheRead` / `cacheWrite` | always `0`; Kiro reports no cache accounting |
 | `usage.cost` | always `0`; there is no token price to apply |
+
+The parser accepts a `usage` frame carrying `inputTokens`/`outputTokens`, and
+when one arrives it takes precedence over both approximations. Treat that as
+an opportunistic path rather than the norm: the API-key stream has not been
+observed to emit it, so in practice both values are estimates.
 
 The real charge arrives as a `meteringEvent` credit amount, which has no
 representation in pi's `Usage` type: every field there is tokens or currency,
 and the footer formats `cost` with a hard-coded `$`. Reporting credits as `cost`
 would render them as dollars, so cost stays `0` rather than showing a confident
-wrong number. Per-model credit rates are surfaced in the model name via
-`rateMultiplier`.
+wrong number. Per-model credit rates are surfaced in the model name: any
+defined `rateMultiplier` other than exactly `1` is annotated, so a discovered
+model comes through as `Claude Opus 4.6 (5x credits)`. The baseline rate (`1`,
+or an absent multiplier) is not annotated.
 
 For the account-level budget, ask Kiro directly — the
 `AmazonCodeWhispererService.GetUsageLimits` operation returns plan, credits
@@ -195,18 +229,26 @@ command to every request's prompt.
 assistant turn in history, which is the byte-stable prefix boundary. It is off
 by default.
 
-The field is accepted on this API-key path, but it showed no measurable effect.
-Repeating the same large prefix returned a byte-identical `meteringEvent` credit
-charge with and without the marker. Time-to-first-token differences also stayed
-within run-to-run noise, and no event variant breaks out cache tokens, so
-`usage.cacheRead` stays `0` either way.
+The field is accepted on this API-key path, but a one-off manual comparison
+showed no measurable effect. Repeating the same large prefix returned a
+byte-identical `meteringEvent` credit charge with and without the marker,
+time-to-first-token differences stayed within run-to-run noise, and no event
+variant breaks out cache tokens, so `usage.cacheRead` stays `0` either way.
+
+Treat that as an undated observation, not a benchmark. The model, region, and
+repeat count were not recorded, no artifact was kept, and nothing in the test
+suite asserts it — the tests cover only where the marker is placed. If the
+answer matters for your workload, re-measure it.
 
 It therefore stays off by default: the flag exists so the behavior can be
 re-measured if Kiro starts reporting cache accounting, not because it is known
 to help.
 
-Set `KIRO_LOG=info` to compare yourself: each attempt logs `stream.firstToken`
-with `ms`, `cachePoints`, and `historyLen`.
+To re-measure, set `KIRO_LOG=info` and compare runs with `KIRO_CACHE_POINTS=1`
+against runs without it, holding the model, region, and history constant. Each
+attempt logs `stream.firstToken` with `ms`, `cachePoints`, and `historyLen`.
+Repeat enough times to separate a real difference from noise, and note that
+`ms` measures time to the first parsed event.
 
 `clientCacheConfig` is intentionally not sent. Its Smithy model carries no
 documentation, so `useClientCachingOnly` semantics are unclear.
@@ -215,17 +257,27 @@ documentation, so `useClientCachingOnly` semantics are unclear.
 
 `KIRO_LOG=error|warn|info|debug` controls diagnostic metadata (default:
 `warn`). Set `KIRO_LOG_FILE=./kiro.log` to write it to a file. Log files are
-created/forced to owner-only `0600` and symlink/non-regular targets are
-rejected where supported.
+opened with the symlink-following and blocking behaviors disabled where
+supported, then validated on the opened descriptor: non-regular targets are
+rejected, files not owned by the current user are rejected where effective-UID
+inspection is available, and the file is forced to owner-only `0600`.
 
-Raw stream chunks, events, and service response bodies can contain prompts or
-responses. They stay disabled even with `KIRO_LOG=debug`; enable them only for
-short-lived local debugging with the separately explicit
-`KIRO_UNSAFE_DEBUG_PAYLOADS=1`. Never use that flag or a shared log path in
-production. Sanitization applies to HTTP service-response diagnostics only:
-normal discovery and stream HTTP errors expose status plus a bounded stable
-service code; arbitrary service message and `errorMessage` fields are omitted.
-It does not sanitize arbitrary application logs or payloads.
+Raw stream chunks, events, service response bodies, and unusable tool-call
+arguments can contain prompts or responses. They stay disabled even with
+`KIRO_LOG=debug`; enable them only for short-lived local debugging with the
+separately explicit `KIRO_UNSAFE_DEBUG_PAYLOADS=1`. Never use that flag or a
+shared log path in production.
+
+Sanitization covers service-reported errors from both transports:
+
+- HTTP errors from discovery and streaming always expose the status, plus a
+  bounded stable service code and `reason` when the response supplies values
+  the sanitizer accepts. A `401`/`403` on the streaming path instead renders a
+  fixed key-rejected message carrying the status only.
+- Streaming `error` frames are reduced to a bounded stable code.
+
+In every case arbitrary service `message` and `errorMessage` prose is omitted.
+Sanitization does not extend to arbitrary application logs or payloads.
 
 - Treat `KIRO_API_KEY` as a secret. Do not commit it, put it in shell history,
   or paste it into logs or issue reports.

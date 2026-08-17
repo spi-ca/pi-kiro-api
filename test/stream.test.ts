@@ -33,6 +33,52 @@ async function withImmediateTimers<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+}
+
+async function withFakeClock<T>(run: (clock: { advance: (ms: number) => void }) => Promise<T>): Promise<T> {
+  const originalDateNow = Date.now;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  let now = 0;
+  let nextTimerId = 0;
+  const timers = new Map<number, { callback: TimerHandler; args: unknown[]; dueAt: number }>();
+
+  Date.now = () => now;
+  globalThis.setTimeout = ((callback: TimerHandler, ms = 0, ...args: unknown[]) => {
+    const id = nextTimerId++;
+    timers.set(id, { callback, args, dueAt: now + ms });
+    return id as unknown as ReturnType<typeof setTimeout>;
+  }) as unknown as typeof setTimeout;
+  globalThis.clearTimeout = ((id: ReturnType<typeof setTimeout>) => {
+    timers.delete(id as unknown as number);
+  }) as typeof clearTimeout;
+
+  try {
+    return await run({
+      advance(ms) {
+        const target = now + ms;
+        while (true) {
+          const next = [...timers.entries()]
+            .filter(([, timer]) => timer.dueAt <= target)
+            .sort(([, a], [, b]) => a.dueAt - b.dueAt)[0];
+          if (!next) break;
+          const [id, timer] = next;
+          now = timer.dueAt;
+          timers.delete(id);
+          if (typeof timer.callback === "function") timer.callback(...timer.args);
+        }
+        now = target;
+      },
+    });
+  } finally {
+    Date.now = originalDateNow;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+}
+
 test("a retried stream emits one start and one terminal done event", async () => {
   const originalFetch = globalThis.fetch;
   const originalSetTimeout = globalThis.setTimeout;
@@ -58,6 +104,185 @@ test("a retried stream emits one start and one terminal done event", async () =>
   } finally {
     globalThis.fetch = originalFetch;
     globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("retries framing-only bytes before a Kiro event", async () => {
+  const originalFetch = globalThis.fetch;
+  const noise = new Uint8Array([0x00, 0x01, 0x02, 0xff]);
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    let reads = 0;
+    return {
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: async () => {
+            reads++;
+            if (reads === 1) return { done: false, value: noise };
+            return new Promise<never>(() => {});
+          },
+          cancel: async () => {},
+        }),
+      },
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    expect(fetchCalls).toBeGreaterThan(1);
+    expect(events.filter((event) => event.type === "start")).toHaveLength(1);
+    expect(["done", "error"]).toContain(String(events.at(-1)?.type));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("does not extend the first-token deadline for framing-only chunks", async () => {
+  const originalFetch = globalThis.fetch;
+  const noise = new Uint8Array([0x00, 0x01, 0x02, 0xff]);
+  let fetchCalls = 0;
+  let reads = 0;
+  let resolveRead: ((result: { done: boolean; value?: Uint8Array }) => void) | undefined;
+  let resolveReadStarted: (() => void) | undefined;
+  let cancelled = false;
+  const readStarted = (target: number) =>
+    new Promise<void>((resolve) => {
+      if (reads >= target) resolve();
+      else resolveReadStarted = resolve;
+    });
+
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    if (fetchCalls > 1) {
+      return new Response('{"content":"after deadline"}{"contextUsagePercentage":1}', { status: 200 });
+    }
+    return {
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: () => {
+            reads++;
+            resolveReadStarted?.();
+            return new Promise<{ done: boolean; value?: Uint8Array }>((resolve) => {
+              resolveRead = resolve;
+            });
+          },
+          cancel: async () => {
+            cancelled = true;
+          },
+        }),
+      },
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withFakeClock(async (clock) => {
+      const eventsPromise = collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
+      await readStarted(1);
+      for (let chunk = 1; chunk <= 4; chunk++) {
+        clock.advance(20_000);
+        resolveRead!({ done: false, value: noise });
+        await readStarted(chunk + 1);
+      }
+
+      clock.advance(10_000);
+      await flushMicrotasks();
+      expect(cancelled).toBe(true);
+      clock.advance(1_000);
+      return await eventsPromise;
+    });
+
+    expect(fetchCalls).toBe(2);
+    expect(events.filter((event) => event.type === "start")).toHaveLength(1);
+    expect(events.at(-1)?.type).toBe("done");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("retries with a fresh first-token deadline before accepting a Kiro event", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let fetchCalls = 0;
+  let firstAttemptCancelled = false;
+  let secondAttemptCancelled = false;
+  let resolveFirstReadStarted: (() => void) | undefined;
+  let resolveSecondReadStarted: (() => void) | undefined;
+  let resolveSecondRead: ((result: { done: boolean; value?: Uint8Array }) => void) | undefined;
+  const firstReadStarted = new Promise<void>((resolve) => {
+    resolveFirstReadStarted = resolve;
+  });
+  const secondReadStarted = new Promise<void>((resolve) => {
+    resolveSecondReadStarted = resolve;
+  });
+
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    if (fetchCalls === 1) {
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: () => {
+              resolveFirstReadStarted?.();
+              return new Promise<{ done: boolean; value?: Uint8Array }>(() => {});
+            },
+            cancel: async () => {
+              firstAttemptCancelled = true;
+            },
+          }),
+        },
+      } as unknown as Response;
+    }
+
+    let reads = 0;
+    return {
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: () => {
+            reads++;
+            if (reads > 1) return Promise.resolve({ done: true });
+            resolveSecondReadStarted?.();
+            return new Promise<{ done: boolean; value?: Uint8Array }>((resolve) => {
+              resolveSecondRead = resolve;
+            });
+          },
+          cancel: async () => {
+            secondAttemptCancelled = true;
+          },
+        }),
+      },
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withFakeClock(async (clock) => {
+      const eventsPromise = collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
+      await firstReadStarted;
+      clock.advance(90_000);
+      await flushMicrotasks();
+      expect(firstAttemptCancelled).toBe(true);
+      clock.advance(1_000);
+      await secondReadStarted;
+
+      clock.advance(89_999);
+      await flushMicrotasks();
+      expect(secondAttemptCancelled).toBe(false);
+      resolveSecondRead!({ done: false, value: encoder.encode('{"content":"fresh deadline"}') });
+      return await eventsPromise;
+    });
+
+    expect(fetchCalls).toBe(2);
+    expect(events.at(-1)?.type).toBe("done");
+    const terminal = events.at(-1) as unknown as { message: { content: Array<{ type: string; text?: string }> } };
+    expect(terminal.message.content).toEqual([expect.objectContaining({ type: "text", text: "fresh deadline" })]);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -246,6 +471,32 @@ test("identical adjacent content frames are preserved", async () => {
   }
 });
 
+test("drops followup prompts while preserving normal content", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      '{"content":"hello"}{"followupPrompt":"this must not appear in the assistant response"}{"content":" world"}',
+      { status: 200 },
+    )) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      message: { stopReason: string; content: Array<{ type: string; text?: string }> };
+    };
+
+    expect(terminal.type).toBe("done");
+    expect(terminal.message.stopReason).not.toBe("error");
+    expect(terminal.message.content).toEqual([expect.objectContaining({ type: "text", text: "hello world" })]);
+    expect(JSON.stringify(terminal.message.content)).not.toContain("this must not appear in the assistant response");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("a literal thinking tag inside prose stays visible text", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () =>
@@ -345,6 +596,204 @@ test("sanitizes cross-provider history before sending Kiro request body", async 
     expect(serialized).not.toContain("|");
     expect(serialized).not.toContain("private signed reasoning");
     expect(serialized).not.toContain("<thinking>");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reports malformed tool call arguments without discarding preceding text", async () => {
+  const originalFetch = globalThis.fetch;
+  const malformedInput = '{"q":';
+  globalThis.fetch = (async () =>
+    new Response(
+      '{"content":"visible text"}{"name":"lookup","toolUseId":"call-1","input":"{\\"q\\":","stop":true}',
+      { status: 200 },
+    )) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      error: {
+        stopReason: string;
+        errorMessage: string;
+        content: Array<{ type: string; text?: string }>;
+      };
+    };
+
+    expect(terminal.type).toBe("error");
+    expect(terminal.error.stopReason).toBe("error");
+    expect(terminal.error.errorMessage).toContain('tool "lookup" returned unusable JSON arguments');
+    expect(terminal.error.errorMessage).not.toContain(malformedInput);
+    expect(terminal.error.content).toEqual([expect.objectContaining({ type: "text", text: "visible text" })]);
+    // The text block must be closed exactly once: the clean-EOF path and the
+    // catch handler both finalize, so an unflagged inline close would emit a
+    // second text_end for the same block.
+    expect(events.filter((event) => event.type === "text_end")).toHaveLength(1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects tool call arguments that parse to a non-object", async () => {
+  const originalFetch = globalThis.fetch;
+  // Each of these is valid JSON but not a record, which is the shape pi's
+  // ToolCall.arguments requires.
+  for (const input of ["null", "[1,2]", '\\"hi\\"', "42"]) {
+    globalThis.fetch = (async () =>
+      new Response(`{"name":"lookup","toolUseId":"c1","input":"${input}","stop":true}`, {
+        status: 200,
+      })) as unknown as typeof fetch;
+
+    try {
+      const events = await withImmediateTimers(() =>
+        collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+      );
+      const terminal = events.at(-1) as unknown as {
+        type: string;
+        error: { stopReason: string; errorMessage: string; content: Array<{ type: string }> };
+      };
+
+      expect(terminal.type).toBe("error");
+      expect(terminal.error.stopReason).toBe("error");
+      expect(terminal.error.errorMessage).toContain("unusable JSON arguments");
+      expect(terminal.error.content.filter((c) => c.type === "toolCall")).toHaveLength(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+});
+
+test("does not retry a malformed tool call behind a stream error", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    // First attempt: an unusable tool call followed by a normally retryable
+    // stream error. Retrying would let the clean second attempt report `stop`
+    // and bury the dropped action.
+    if (fetchCalls === 1) {
+      return new Response(
+        '{"name":"lookup","toolUseId":"c1","input":"{bad","stop":true}{"error":"temporary","message":"m"}',
+        { status: 200 },
+      );
+    }
+    return new Response('{"content":"clean"}{"contextUsagePercentage":5}', { status: 200 });
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      error: { stopReason: string; errorMessage: string };
+    };
+
+    expect(fetchCalls).toBe(1);
+    expect(terminal.type).toBe("error");
+    expect(terminal.error.errorMessage).toContain("unusable JSON arguments");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("keeps the tool call reason when the reader fails afterwards", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  // A later transport failure must not replace an already-detected unusable
+  // tool call: that would hide the dropped action all over again.
+  globalThis.fetch = (async () => {
+    let reads = 0;
+    return {
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: async () => {
+            reads++;
+            if (reads === 1) {
+              return {
+                done: false,
+                value: encoder.encode('{"name":"lookup","toolUseId":"c1","input":"{bad","stop":true}'),
+              };
+            }
+            throw new Error("reader exploded");
+          },
+          cancel: async () => {},
+        }),
+      },
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      error: { errorMessage: string };
+    };
+
+    expect(terminal.type).toBe("error");
+    expect(terminal.error.errorMessage).toContain("unusable JSON arguments");
+    expect(terminal.error.errorMessage).not.toContain("reader exploded");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("does not echo a hostile tool name into logs or the error message", async () => {
+  const originalFetch = globalThis.fetch;
+  const forged = "x\n[pi-kiro-api] ERROR forged line\u001b[31m";
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({ name: forged, toolUseId: "id\nfake", input: "{bad", stop: true }),
+      { status: 200 },
+    )) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as { type: string; error: { errorMessage: string } };
+
+    expect(terminal.type).toBe("error");
+    // The wire-supplied name and ID fail the identifier allowlist, so neither
+    // the newline nor the escape sequence can reach a console-formatted line.
+    expect(terminal.error.errorMessage).toBe(
+      'Kiro API error: tool "unknown" returned unusable JSON arguments',
+    );
+    expect(terminal.error.errorMessage).not.toContain("\n");
+    expect(terminal.error.errorMessage).not.toContain("\u001b");
+    expect(terminal.error.errorMessage).not.toContain("forged");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("accepts empty tool call arguments as an empty object", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      '{"name":"lookup","toolUseId":"call-1","input":"   ","stop":true}{"contextUsagePercentage":10}',
+      { status: 200 },
+    )) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      message: { content: Array<{ type: string; name?: string; id?: string; arguments?: unknown }> };
+    };
+
+    expect(terminal.type).toBe("done");
+    expect(terminal.message.content).toEqual([
+      expect.objectContaining({ type: "toolCall", name: "lookup", id: "call-1", arguments: {} }),
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }

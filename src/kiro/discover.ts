@@ -48,14 +48,18 @@ function buildUserAgent(): string {
 
 /**
  * Static per-model behavior flags the API does not report. Keyed by Kiro's
- * dot-form ID. `reasoningHidden` and `firstTokenTimeout` are client-side
- * concerns discovered empirically, so they stay hand-maintained and are
- * merged onto whatever the API returns.
+ * dot-form ID. `reasoning`, `reasoningHidden`, and `firstTokenTimeout` are
+ * client-side concerns discovered empirically, so they stay hand-maintained and
+ * are merged onto whatever the API returns.
  */
 const BEHAVIOR_BY_KIRO_ID: Record<string, Partial<KiroModel>> = Object.fromEntries(
   kiroModels.map((m) => [
     m.id.replace(/(\d)-(\d)/g, "$1.$2"),
     {
+      // Only a hand-maintained `false` is carried over. The default for an
+      // unlisted model stays `true` (see toKiroModel), so a model absent from
+      // the static catalog is unaffected.
+      ...(m.reasoning === false ? { reasoning: false } : {}),
       ...(m.reasoningHidden ? { reasoningHidden: true } : {}),
       ...(m.firstTokenTimeout ? { firstTokenTimeout: m.firstTokenTimeout } : {}),
     },
@@ -77,6 +81,18 @@ function toPiId(kiroId: string): string {
   return kiroId.replace(/(\d)\.(\d)/g, "$1-$2");
 }
 
+/**
+ * Append the credit rate multiplier to a model's display name, e.g.
+ * "Claude Sonnet 4.6 (2x credits)". Kiro bills in credits via
+ * `rateMultiplier`, not per-token USD, so `cost` stays zero and this is the
+ * only place that surfaces relative price. A multiplier of exactly `1` (or
+ * absent) is the baseline rate and is not called out.
+ */
+function withRateMultiplier(name: string, rateMultiplier?: number): string {
+  if (rateMultiplier === undefined || rateMultiplier === 1) return name;
+  return `${name} (${rateMultiplier}x credits)`;
+}
+
 function toKiroModel(api: ApiModel, baseUrl: string): KiroModel {
   const piId = toPiId(api.modelId);
   const types = api.supportedInputTypes ?? ["TEXT"];
@@ -89,14 +105,15 @@ function toKiroModel(api: ApiModel, baseUrl: string): KiroModel {
   // than one chosen before that flag is known.
   return withThinkingLevels({
     id: piId,
-    name: api.modelName ?? piId,
+    name: withRateMultiplier(api.modelName ?? piId, api.rateMultiplier),
     api: "kiro-api",
     provider: "kiro",
     baseUrl,
-    // The API reports no reasoning capability flag. Treat every model as
+    // The API reports no reasoning capability flag. Default to
     // reasoning-capable: stream.ts gates the `<thinking_mode>` directive on
     // this, and an unnecessary directive is far cheaper than suppressing
-    // reasoning on a model that supports it.
+    // reasoning on a model that supports it. Models known not to reason are
+    // corrected by the BEHAVIOR_BY_KIRO_ID merge below.
     reasoning: true,
     input,
     // Kiro bills in credits via rateMultiplier, not per-token USD. There is
