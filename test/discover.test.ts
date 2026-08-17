@@ -104,6 +104,48 @@ describe("Kiro model discovery", () => {
     );
   });
 
+  test("surfaces rateMultiplier in the model display name", async () => {
+    const models = await withMockFetch(
+      async () =>
+        new Response(
+          JSON.stringify({
+            models: [
+              {
+                modelId: "claude-opus-4.6",
+                modelName: "Claude Opus 4.6",
+                rateMultiplier: 5,
+                supportedInputTypes: ["TEXT"],
+              },
+              {
+                modelId: "claude-sonnet-4.6",
+                modelName: "Claude Sonnet 4.6",
+                rateMultiplier: 1,
+                supportedInputTypes: ["TEXT"],
+              },
+              {
+                modelId: "deepseek-3.2",
+                modelName: "DeepSeek 3.2",
+                supportedInputTypes: ["TEXT"],
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      () => discoverKiroModels("ksk_test-key", BASE_URL),
+    );
+
+    const opus = models.find((m) => m.id === "claude-opus-4-6");
+    expect(opus?.name).toBe("Claude Opus 4.6 (5x credits)");
+
+    // rateMultiplier === 1 is the baseline; not surfaced.
+    const sonnet = models.find((m) => m.id === "claude-sonnet-4-6");
+    expect(sonnet?.name).toBe("Claude Sonnet 4.6");
+
+    // undefined rateMultiplier is treated the same as 1.
+    const deepseek = models.find((m) => m.id === "deepseek-3-2");
+    expect(deepseek?.name).toBe("DeepSeek 3.2");
+  });
+
   test("rejects empty and all-invalid discovery responses", async () => {
     await withMockFetch(
       async () => new Response(JSON.stringify({ models: [] }), { status: 200 }),

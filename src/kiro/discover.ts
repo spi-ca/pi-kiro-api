@@ -77,6 +77,18 @@ function toPiId(kiroId: string): string {
   return kiroId.replace(/(\d)\.(\d)/g, "$1-$2");
 }
 
+/**
+ * Append the credit rate multiplier to a model's display name, e.g.
+ * "Claude Sonnet 4.6 (2x credits)". Kiro bills in credits via
+ * `rateMultiplier`, not per-token USD, so `cost` stays zero and this is the
+ * only place that surfaces relative price. A multiplier of exactly `1` (or
+ * absent) is the baseline rate and is not called out.
+ */
+function withRateMultiplier(name: string, rateMultiplier?: number): string {
+  if (rateMultiplier === undefined || rateMultiplier === 1) return name;
+  return `${name} (${rateMultiplier}x credits)`;
+}
+
 function toKiroModel(api: ApiModel, baseUrl: string): KiroModel {
   const piId = toPiId(api.modelId);
   const types = api.supportedInputTypes ?? ["TEXT"];
@@ -89,7 +101,7 @@ function toKiroModel(api: ApiModel, baseUrl: string): KiroModel {
   // than one chosen before that flag is known.
   return withThinkingLevels({
     id: piId,
-    name: api.modelName ?? piId,
+    name: withRateMultiplier(api.modelName ?? piId, api.rateMultiplier),
     api: "kiro-api",
     provider: "kiro",
     baseUrl,
