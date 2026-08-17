@@ -151,6 +151,31 @@ function findNextEventStart(buffer: string, from: number): number {
   return earliest;
 }
 
+/** Longest event prefix, so a split prefix can never be longer than this. */
+const MAX_PATTERN_LENGTH = Math.max(...EVENT_PATTERNS.map((p) => p.length));
+
+/**
+ * Cap on retained bytes for an event that has not closed yet. Kiro frames are
+ * small; a buffer this large means the response is not producing closable
+ * events, and retaining it without bound would grow memory for the life of the
+ * stream.
+ */
+const MAX_RETAINED_BYTES = 1_048_576;
+
+/**
+ * Length of the tail to keep when no event prefix is present.
+ *
+ * A prefix can straddle a chunk boundary (`{\"cont` + `ent\":...`), so dropping
+ * the whole remainder would lose the event. Keeping the last
+ * `MAX_PATTERN_LENGTH - 1` characters is enough to complete any prefix on the
+ * next chunk while still discarding framing noise.
+ */
+function tailForSplitPrefix(buffer: string, from: number): string {
+  const gap = buffer.substring(from);
+  if (gap.length <= MAX_PATTERN_LENGTH - 1) return gap;
+  return gap.substring(gap.length - (MAX_PATTERN_LENGTH - 1));
+}
+
 export function parseKiroEvents(
   buffer: string,
 ): { events: KiroStreamEvent[]; remaining: string } {
@@ -173,7 +198,9 @@ export function parseKiroEvents(
           });
         }
       }
-      break;
+      // Keep only enough of the tail to complete a prefix split across the
+      // chunk boundary; the rest is framing noise.
+      return { events, remaining: tailForSplitPrefix(buffer, pos) };
     }
 
     if (log.isUnsafeDebugPayloadEnabled() && jsonStart > pos) {
@@ -191,8 +218,16 @@ export function parseKiroEvents(
 
     const jsonEnd = findJsonEnd(buffer, jsonStart);
     if (jsonEnd < 0) {
-      // Incomplete JSON at end of buffer — preserve for next call.
-      return { events, remaining: buffer.substring(jsonStart) };
+      // Incomplete JSON at end of buffer — preserve for next call, unless it
+      // has grown past the point where a real Kiro frame could still close.
+      const retained = buffer.substring(jsonStart);
+      if (retained.length > MAX_RETAINED_BYTES) {
+        log.warn(
+          `discarding ${retained.length} bytes of unterminated stream event (limit ${MAX_RETAINED_BYTES})`,
+        );
+        return { events, remaining: "" };
+      }
+      return { events, remaining: retained };
     }
 
     try {
