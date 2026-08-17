@@ -229,18 +229,26 @@ command to every request's prompt.
 assistant turn in history, which is the byte-stable prefix boundary. It is off
 by default.
 
-The field is accepted on this API-key path, but it showed no measurable effect.
-Repeating the same large prefix returned a byte-identical `meteringEvent` credit
-charge with and without the marker. Time-to-first-token differences also stayed
-within run-to-run noise, and no event variant breaks out cache tokens, so
-`usage.cacheRead` stays `0` either way.
+The field is accepted on this API-key path, but a one-off manual comparison
+showed no measurable effect. Repeating the same large prefix returned a
+byte-identical `meteringEvent` credit charge with and without the marker,
+time-to-first-token differences stayed within run-to-run noise, and no event
+variant breaks out cache tokens, so `usage.cacheRead` stays `0` either way.
+
+Treat that as an undated observation, not a benchmark. The model, region, and
+repeat count were not recorded, no artifact was kept, and nothing in the test
+suite asserts it — the tests cover only where the marker is placed. If the
+answer matters for your workload, re-measure it.
 
 It therefore stays off by default: the flag exists so the behavior can be
 re-measured if Kiro starts reporting cache accounting, not because it is known
 to help.
 
-Set `KIRO_LOG=info` to compare yourself: each attempt logs `stream.firstToken`
-with `ms`, `cachePoints`, and `historyLen`.
+To re-measure, set `KIRO_LOG=info` and compare runs with `KIRO_CACHE_POINTS=1`
+against runs without it, holding the model, region, and history constant. Each
+attempt logs `stream.firstToken` with `ms`, `cachePoints`, and `historyLen`.
+Repeat enough times to separate a real difference from noise, and note that
+`ms` measures time to the first parsed event.
 
 `clientCacheConfig` is intentionally not sent. Its Smithy model carries no
 documentation, so `useClientCachingOnly` semantics are unclear.
