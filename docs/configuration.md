@@ -213,10 +213,10 @@ The real charge arrives as a `meteringEvent` credit amount, which has no
 representation in pi's `Usage` type: every field there is tokens or currency,
 and the footer formats `cost` with a hard-coded `$`. Reporting credits as `cost`
 would render them as dollars, so cost stays `0` rather than showing a confident
-wrong number. Per-model credit rates are surfaced in the model name: a
-discovered model whose `rateMultiplier` is greater than `1` is displayed as
-`Claude Opus 4.6 (5x credits)`. The baseline rate (`1`, or an absent
-multiplier) is not annotated.
+wrong number. Per-model credit rates are surfaced in the model name: any
+defined `rateMultiplier` other than exactly `1` is annotated, so a discovered
+model comes through as `Claude Opus 4.6 (5x credits)`. The baseline rate (`1`,
+or an absent multiplier) is not annotated.
 
 For the account-level budget, ask Kiro directly — the
 `AmazonCodeWhispererService.GetUsageLimits` operation returns plan, credits
@@ -258,11 +258,11 @@ documentation, so `useClientCachingOnly` semantics are unclear.
 `KIRO_LOG=error|warn|info|debug` controls diagnostic metadata (default:
 `warn`). Set `KIRO_LOG_FILE=./kiro.log` to write it to a file. Log files are
 opened with the symlink-following and blocking behaviors disabled where
-supported, then validated on the opened descriptor: non-regular targets and
-files not owned by the current user are rejected, and the file is forced to
-owner-only `0600`.
+supported, then validated on the opened descriptor: non-regular targets are
+rejected, files not owned by the current user are rejected where effective-UID
+inspection is available, and the file is forced to owner-only `0600`.
 
-Raw stream chunks, events, service response bodies, and malformed tool-call
+Raw stream chunks, events, service response bodies, and unusable tool-call
 arguments can contain prompts or responses. They stay disabled even with
 `KIRO_LOG=debug`; enable them only for short-lived local debugging with the
 separately explicit `KIRO_UNSAFE_DEBUG_PAYLOADS=1`. Never use that flag or a
@@ -270,11 +270,13 @@ shared log path in production.
 
 Sanitization covers service-reported errors from both transports:
 
-- HTTP errors from discovery and streaming expose the status plus a bounded
-  stable service code (and `reason` when present).
+- HTTP errors from discovery and streaming always expose the status, plus a
+  bounded stable service code and `reason` when the response supplies values
+  the sanitizer accepts. A `401`/`403` on the streaming path instead renders a
+  fixed key-rejected message carrying the status only.
 - Streaming `error` frames are reduced to a bounded stable code.
 
-In both cases arbitrary service `message` and `errorMessage` prose is omitted.
+In every case arbitrary service `message` and `errorMessage` prose is omitted.
 Sanitization does not extend to arbitrary application logs or payloads.
 
 - Treat `KIRO_API_KEY` as a secret. Do not commit it, put it in shell history,
