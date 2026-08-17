@@ -238,17 +238,25 @@ documentation, so `useClientCachingOnly` semantics are unclear.
 
 `KIRO_LOG=error|warn|info|debug` controls diagnostic metadata (default:
 `warn`). Set `KIRO_LOG_FILE=./kiro.log` to write it to a file. Log files are
-created/forced to owner-only `0600` and symlink/non-regular targets are
-rejected where supported.
+opened with the symlink-following and blocking behaviors disabled where
+supported, then validated on the opened descriptor: non-regular targets and
+files not owned by the current user are rejected, and the file is forced to
+owner-only `0600`.
 
-Raw stream chunks, events, and service response bodies can contain prompts or
-responses. They stay disabled even with `KIRO_LOG=debug`; enable them only for
-short-lived local debugging with the separately explicit
-`KIRO_UNSAFE_DEBUG_PAYLOADS=1`. Never use that flag or a shared log path in
-production. Sanitization applies to HTTP service-response diagnostics only:
-normal discovery and stream HTTP errors expose status plus a bounded stable
-service code; arbitrary service message and `errorMessage` fields are omitted.
-It does not sanitize arbitrary application logs or payloads.
+Raw stream chunks, events, service response bodies, and malformed tool-call
+arguments can contain prompts or responses. They stay disabled even with
+`KIRO_LOG=debug`; enable them only for short-lived local debugging with the
+separately explicit `KIRO_UNSAFE_DEBUG_PAYLOADS=1`. Never use that flag or a
+shared log path in production.
+
+Sanitization covers service-reported errors from both transports:
+
+- HTTP errors from discovery and streaming expose the status plus a bounded
+  stable service code (and `reason` when present).
+- Streaming `error` frames are reduced to a bounded stable code.
+
+In both cases arbitrary service `message` and `errorMessage` prose is omitted.
+Sanitization does not extend to arbitrary application logs or payloads.
 
 - Treat `KIRO_API_KEY` as a secret. Do not commit it, put it in shell history,
   or paste it into logs or issue reports.
