@@ -167,22 +167,30 @@ budget is capped at 200,000 tokens.
 
 ## Usage and cost reporting
 
-Kiro bills in credits, not per-token USD, and its stream reports no token
-counts. The footer and `/session` therefore show approximations:
+Kiro bills in credits, not per-token USD, and its stream normally reports no
+token counts. The footer and `/session` therefore usually show
+approximations:
 
 | Field | Source |
 |---|---|
-| `usage.input` | derived from `contextUsageEvent` percentage × context window |
-| `usage.output` | estimated at ~4 characters per token |
+| `usage.input` | a `usage` event's `inputTokens` when present, otherwise derived from `contextUsageEvent` percentage × context window |
+| `usage.output` | a `usage` event's `outputTokens` when present, otherwise estimated at ~4 characters per token |
 | `usage.cacheRead` / `cacheWrite` | always `0`; Kiro reports no cache accounting |
 | `usage.cost` | always `0`; there is no token price to apply |
+
+The parser accepts a `usage` frame carrying `inputTokens`/`outputTokens`, and
+when one arrives it takes precedence over both approximations. Treat that as
+an opportunistic path rather than the norm: the API-key stream has not been
+observed to emit it, so in practice both values are estimates.
 
 The real charge arrives as a `meteringEvent` credit amount, which has no
 representation in pi's `Usage` type: every field there is tokens or currency,
 and the footer formats `cost` with a hard-coded `$`. Reporting credits as `cost`
 would render them as dollars, so cost stays `0` rather than showing a confident
-wrong number. Per-model credit rates are surfaced in the model name via
-`rateMultiplier`.
+wrong number. Per-model credit rates are surfaced in the model name: a
+discovered model whose `rateMultiplier` is greater than `1` is displayed as
+`Claude Opus 4.6 (5x credits)`. The baseline rate (`1`, or an absent
+multiplier) is not annotated.
 
 For the account-level budget, ask Kiro directly — the
 `AmazonCodeWhispererService.GetUsageLimits` operation returns plan, credits
