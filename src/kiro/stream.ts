@@ -29,6 +29,7 @@ import { calculateCost, createAssistantMessageEventStream } from "@earendil-work
 import { log, previewChunk } from "./debug.ts";
 import {
   readResponseTextBounded,
+  safeIdentifier,
   sanitizeKiroError,
   sanitizeKiroStreamEventError,
 } from "./errors.ts";
@@ -235,8 +236,11 @@ function emitToolCall(
         error: e instanceof Error ? e.message : String(e),
       });
     }
-    const reason = `tool "${state.name}" returned unusable JSON arguments`;
-    log.warn(`${reason} (${state.toolUseId})`);
+    // The tool name and ID come off the wire, so they are rendered through the
+    // identifier allowlist. Echoing them raw would let a response forge a log
+    // line or emit terminal escapes through this message.
+    const reason = `tool "${safeIdentifier(state.name)}" returned unusable JSON arguments`;
+    log.warn(`${reason} (${safeIdentifier(state.toolUseId)})`);
     return reason;
   }
 

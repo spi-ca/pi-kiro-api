@@ -38,6 +38,18 @@ function stableCode(value: unknown): string | undefined {
   return /^[A-Za-z0-9._:-]+$/.test(code) ? code.slice(0, MAX_ERROR_CODE_LENGTH) : undefined;
 }
 
+/**
+ * Render a service-supplied identifier for a user-facing message or log line.
+ *
+ * Tool names and IDs come off the wire, so they can carry newlines, terminal
+ * escapes, or prompt text. Anything outside the identifier shape is replaced
+ * rather than echoed: a forged log line or an ANSI sequence in a console
+ * message is not worth the extra specificity.
+ */
+export function safeIdentifier(value: unknown, fallback = "unknown"): string {
+  return stableCode(value) ?? fallback;
+}
+
 function stableType(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const fragment = value.includes("#") ? value.split("#").pop() : value;

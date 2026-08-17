@@ -744,6 +744,35 @@ test("keeps the tool call reason when the reader fails afterwards", async () => 
   }
 });
 
+test("does not echo a hostile tool name into logs or the error message", async () => {
+  const originalFetch = globalThis.fetch;
+  const forged = "x\n[pi-kiro-api] ERROR forged line\u001b[31m";
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({ name: forged, toolUseId: "id\nfake", input: "{bad", stop: true }),
+      { status: 200 },
+    )) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as { type: string; error: { errorMessage: string } };
+
+    expect(terminal.type).toBe("error");
+    // The wire-supplied name and ID fail the identifier allowlist, so neither
+    // the newline nor the escape sequence can reach a console-formatted line.
+    expect(terminal.error.errorMessage).toBe(
+      'Kiro API error: tool "unknown" returned unusable JSON arguments',
+    );
+    expect(terminal.error.errorMessage).not.toContain("\n");
+    expect(terminal.error.errorMessage).not.toContain("\u001b");
+    expect(terminal.error.errorMessage).not.toContain("forged");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("accepts empty tool call arguments as an empty object", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () =>
