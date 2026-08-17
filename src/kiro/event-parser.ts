@@ -155,12 +155,25 @@ function findNextEventStart(buffer: string, from: number): number {
 const MAX_PATTERN_LENGTH = Math.max(...EVENT_PATTERNS.map((p) => p.length));
 
 /**
- * Cap on retained bytes for an event that has not closed yet. Kiro frames are
- * small; a buffer this large means the response is not producing closable
- * events, and retaining it without bound would grow memory for the life of the
- * stream.
+ * Cap on retained characters for an event that has not closed yet.
+ *
+ * This is a memory bound, not a protocol limit: nothing in Kiro's wire format
+ * states a maximum frame size. It is set far above any observed frame so that
+ * hitting it means the response is not producing closable events. Exceeding it
+ * is reported to the caller rather than discarded, since dropping the buffer
+ * would silently truncate output or trigger an empty-response retry.
  */
 const MAX_RETAINED_BYTES = 1_048_576;
+
+/** Raised when an unterminated event grows past {@link MAX_RETAINED_BYTES}. */
+export class KiroEventBufferOverflowError extends Error {
+  constructor(readonly retainedBytes: number) {
+    super(
+      `unterminated Kiro stream event exceeded ${MAX_RETAINED_BYTES} characters (retained ${retainedBytes})`,
+    );
+    this.name = "KiroEventBufferOverflowError";
+  }
+}
 
 /**
  * Length of the tail to keep when no event prefix is present.
@@ -219,13 +232,12 @@ export function parseKiroEvents(
     const jsonEnd = findJsonEnd(buffer, jsonStart);
     if (jsonEnd < 0) {
       // Incomplete JSON at end of buffer — preserve for next call, unless it
-      // has grown past the point where a real Kiro frame could still close.
+      // has grown past the memory bound. Any events already parsed from this
+      // buffer are lost with the throw, but they would be an incomplete
+      // response either way; failing loudly beats a silent truncation.
       const retained = buffer.substring(jsonStart);
       if (retained.length > MAX_RETAINED_BYTES) {
-        log.warn(
-          `discarding ${retained.length} bytes of unterminated stream event (limit ${MAX_RETAINED_BYTES})`,
-        );
-        return { events, remaining: "" };
+        throw new KiroEventBufferOverflowError(retained.length);
       }
       return { events, remaining: retained };
     }

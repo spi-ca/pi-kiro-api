@@ -1,5 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
-import { log } from "../src/kiro/debug.ts";
+import { expect, test } from "bun:test";
 import { findJsonEnd, parseKiroEvent, parseKiroEvents } from "../src/kiro/event-parser.ts";
 
 test("returns negative one when JSON is incomplete", () => {
@@ -108,16 +107,11 @@ test("bounds retained framing-only noise across calls", () => {
   expect(remaining).toHaveLength(25);
 });
 
-test("discards oversized unterminated events and logs a warning", () => {
-  const warnSpy = spyOn(log, "warn").mockImplementation(() => {});
-  try {
-    const result = parseKiroEvents('{"content":"' + "x".repeat(1_048_576));
-
-    expect(result).toEqual({ events: [], remaining: "" });
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("discarding 1048588 bytes of unterminated stream event"),
-    );
-  } finally {
-    warnSpy.mockRestore();
-  }
+test("raises rather than discarding an oversized unterminated event", () => {
+  // The cap is a memory bound, not a protocol limit, so exceeding it is
+  // reported to the caller. Silently dropping the buffer would truncate output
+  // or trigger an empty-response retry.
+  expect(() => parseKiroEvents('{"content":"' + "x".repeat(1_048_576))).toThrow(
+    /exceeded 1048576 characters/,
+  );
 });
