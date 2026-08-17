@@ -434,9 +434,76 @@ test("reports malformed tool call arguments without discarding preceding text", 
 
     expect(terminal.type).toBe("error");
     expect(terminal.error.stopReason).toBe("error");
-    expect(terminal.error.errorMessage).toContain('tool "lookup" returned malformed JSON arguments');
+    expect(terminal.error.errorMessage).toContain('tool "lookup" returned unusable JSON arguments');
     expect(terminal.error.errorMessage).not.toContain(malformedInput);
     expect(terminal.error.content).toEqual([expect.objectContaining({ type: "text", text: "visible text" })]);
+    // The text block must be closed exactly once: the clean-EOF path and the
+    // catch handler both finalize, so an unflagged inline close would emit a
+    // second text_end for the same block.
+    expect(events.filter((event) => event.type === "text_end")).toHaveLength(1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects tool call arguments that parse to a non-object", async () => {
+  const originalFetch = globalThis.fetch;
+  // Each of these is valid JSON but not a record, which is the shape pi's
+  // ToolCall.arguments requires.
+  for (const input of ["null", "[1,2]", '\\"hi\\"', "42"]) {
+    globalThis.fetch = (async () =>
+      new Response(`{"name":"lookup","toolUseId":"c1","input":"${input}","stop":true}`, {
+        status: 200,
+      })) as unknown as typeof fetch;
+
+    try {
+      const events = await withImmediateTimers(() =>
+        collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+      );
+      const terminal = events.at(-1) as unknown as {
+        type: string;
+        error: { stopReason: string; errorMessage: string; content: Array<{ type: string }> };
+      };
+
+      expect(terminal.type).toBe("error");
+      expect(terminal.error.stopReason).toBe("error");
+      expect(terminal.error.errorMessage).toContain("unusable JSON arguments");
+      expect(terminal.error.content.filter((c) => c.type === "toolCall")).toHaveLength(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+});
+
+test("does not retry a malformed tool call behind a stream error", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    // First attempt: an unusable tool call followed by a normally retryable
+    // stream error. Retrying would let the clean second attempt report `stop`
+    // and bury the dropped action.
+    if (fetchCalls === 1) {
+      return new Response(
+        '{"name":"lookup","toolUseId":"c1","input":"{bad","stop":true}{"error":"temporary","message":"m"}',
+        { status: 200 },
+      );
+    }
+    return new Response('{"content":"clean"}{"contextUsagePercentage":5}', { status: 200 });
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      error: { stopReason: string; errorMessage: string };
+    };
+
+    expect(fetchCalls).toBe(1);
+    expect(terminal.type).toBe("error");
+    expect(terminal.error.errorMessage).toContain("unusable JSON arguments");
   } finally {
     globalThis.fetch = originalFetch;
   }

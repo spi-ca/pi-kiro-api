@@ -216,7 +216,14 @@ function emitToolCall(
 
   let args: Record<string, unknown>;
   try {
-    args = JSON.parse(state.input) as Record<string, unknown>;
+    const parsed = JSON.parse(state.input) as unknown;
+    // Valid JSON is not enough: pi's ToolCall.arguments is a record, and
+    // `null`, arrays, strings, and numbers all parse cleanly. Passing one
+    // through would hand the tool-execution layer a shape it cannot use.
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("tool arguments must be a JSON object");
+    }
+    args = parsed as Record<string, unknown>;
   } catch (e) {
     // The parse exception text can quote the offending input, so it stays
     // behind the unsafe-payload gate like every other raw payload.
@@ -228,7 +235,7 @@ function emitToolCall(
         error: e instanceof Error ? e.message : String(e),
       });
     }
-    const reason = `tool "${state.name}" returned malformed JSON arguments`;
+    const reason = `tool "${state.name}" returned unusable JSON arguments`;
     log.warn(`${reason} (${state.toolUseId})`);
     return reason;
   }
@@ -838,6 +845,15 @@ export function streamKiro(
 
         if (idleTimer) clearTimeout(idleTimer);
 
+        // A malformed tool call is a property of the response, not of the
+        // transport, so it is decided before any retry. Retrying would let a
+        // clean second attempt report `stop` while the dropped action from the
+        // first attempt goes unmentioned.
+        if (toolCallError) {
+          closeOpenProviderBlocks();
+          throw new Error(`Kiro API error: ${toolCallError}`);
+        }
+
         if (firstTokenTimedOut || idleCancelled || streamError) {
           if (!providerContentEmitted && retryCount < MAX_RETRIES) {
             retryCount++;
@@ -873,26 +889,16 @@ export function streamKiro(
         }
 
         flushToolCall();
-        if (thinkingParser) {
-          thinkingParser.finalize();
-          textBlockIndex = thinkingParser.getTextBlockIndex();
-        }
+        // Same finalize-and-close-text sequence as the error paths, routed
+        // through the shared helper so its idempotence flag is set. Closing it
+        // inline here would let a later closeActiveAttempt() emit a second
+        // text_end for the same block.
+        closeOpenProviderBlocks();
 
-        if (textBlockIndex !== null) {
-          const block = output.content[textBlockIndex] as TextContent | undefined;
-          if (block) {
-            stream.push({
-              type: "text_end",
-              contentIndex: textBlockIndex,
-              content: block.text,
-              partial: output,
-            });
-          }
-        }
-
-        // Raised only after the text block is closed, so the partial response
-        // stays balanced. Not retried: the caller is told the turn failed
-        // rather than receiving a `stop` that hides a dropped action.
+        // The trailing flushToolCall() above can be the first to see a
+        // malformed call, so this is checked again after the pre-retry gate.
+        // Not retried: the caller is told the turn failed rather than
+        // receiving a `stop` that hides a dropped action.
         if (toolCallError) throw new Error(`Kiro API error: ${toolCallError}`);
 
         if (usageEvent?.inputTokens !== undefined) output.usage.input = usageEvent.inputTokens;
