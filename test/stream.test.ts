@@ -246,6 +246,32 @@ test("identical adjacent content frames are preserved", async () => {
   }
 });
 
+test("drops followup prompts while preserving normal content", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      '{"content":"hello"}{"followupPrompt":"this must not appear in the assistant response"}{"content":" world"}',
+      { status: 200 },
+    )) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      message: { stopReason: string; content: Array<{ type: string; text?: string }> };
+    };
+
+    expect(terminal.type).toBe("done");
+    expect(terminal.message.stopReason).not.toBe("error");
+    expect(terminal.message.content).toEqual([expect.objectContaining({ type: "text", text: "hello world" })]);
+    expect(JSON.stringify(terminal.message.content)).not.toContain("this must not appear in the assistant response");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("a literal thinking tag inside prose stays visible text", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () =>

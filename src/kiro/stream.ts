@@ -784,6 +784,20 @@ export function streamKiro(
                 void reader.cancel().catch(() => {});
                 break;
               }
+              case "followupPrompt": {
+                // Kiro suggests a follow-up question for its own chat UI.
+                // pi's AssistantMessage has no field for suggested prompts,
+                // and injecting it as text would put words in the model's
+                // mouth. Drop it deliberately rather than implicitly.
+                break;
+              }
+              default: {
+                // Exhaustiveness guard: a new KiroStreamEvent variant must be
+                // handled or explicitly ignored above, not silently dropped.
+                const unhandled: never = event;
+                void unhandled;
+                break;
+              }
             }
             if (streamError) break;
           }
