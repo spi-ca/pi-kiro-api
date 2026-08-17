@@ -61,6 +61,40 @@ test("a retried stream emits one start and one terminal done event", async () =>
   }
 });
 
+test("retries framing-only bytes before a Kiro event", async () => {
+  const originalFetch = globalThis.fetch;
+  const noise = new Uint8Array([0x00, 0x01, 0x02, 0xff]);
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    let reads = 0;
+    return {
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: async () => {
+            reads++;
+            if (reads === 1) return { done: false, value: noise };
+            return new Promise<never>(() => {});
+          },
+          cancel: async () => {},
+        }),
+      },
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    expect(fetchCalls).toBeGreaterThan(1);
+    expect(events.filter((event) => event.type === "start")).toHaveLength(1);
+    expect(["done", "error"]).toContain(String(events.at(-1)?.type));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("retries a stream error before provider output with one logical start", async () => {
   const originalFetch = globalThis.fetch;
   let fetchCalls = 0;

@@ -664,10 +664,20 @@ export function streamKiro(
           closeOpenProviderBlocks();
         };
 
+        // "First token" means the first *parsed event*, not the first bytes
+        // off the socket. Kiro wraps its JSON events in an AWS Event Stream
+        // envelope, so a stalled response can deliver framing bytes that
+        // contain no event. Treating those as a first token would retire the
+        // first-token guard and leave the request waiting for the much longer
+        // idle timeout.
+        //
+        // The deadline is absolute per attempt so that repeated framing-only
+        // chunks cannot extend the budget by re-arming a fresh timer.
         let gotFirstToken = false;
         let firstTokenTimedOut = false;
         let streamError: string | null = null;
         const attemptStartedAt = Date.now();
+        const firstTokenDeadline = attemptStartedAt + firstTokenTimeoutForModel(model.id);
         const FIRST_TOKEN_SENTINEL = Symbol("firstTokenTimeout");
         type ReadResult = { done: boolean; value?: Uint8Array };
 
@@ -676,13 +686,11 @@ export function streamKiro(
           if (!gotFirstToken) {
             const readPromise = reader.read() as Promise<ReadResult>;
             let firstTokenTimer: ReturnType<typeof setTimeout> | null = null;
+            const remainingMs = Math.max(0, firstTokenDeadline - Date.now());
             const result = await Promise.race([
               readPromise,
               new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
-                firstTokenTimer = setTimeout(
-                  () => resolve(FIRST_TOKEN_SENTINEL),
-                  firstTokenTimeoutForModel(model.id),
-                );
+                firstTokenTimer = setTimeout(() => resolve(FIRST_TOKEN_SENTINEL), remainingMs);
               }),
             ]);
             // Always clear the timer — otherwise the happy path keeps the
@@ -697,15 +705,6 @@ export function streamKiro(
               break;
             }
             readResult = result as ReadResult;
-            gotFirstToken = true;
-            // Cache effectiveness has no wire accounting, so log TTFT to make
-            // an opt-in comparison measurable.
-            log.info("stream.firstToken", {
-              ms: Date.now() - attemptStartedAt,
-              cachePoints: useCachePoints,
-              historyLen: history.length,
-            });
-            resetIdle();
           } else {
             readResult = (await reader.read()) as ReadResult;
           }
@@ -725,6 +724,17 @@ export function streamKiro(
           const { events, remaining } = parseKiroEvents(buffer);
           buffer = remaining;
           resetIdle();
+
+          if (!gotFirstToken && events.length > 0) {
+            gotFirstToken = true;
+            // Cache effectiveness has no wire accounting, so log TTFT to make
+            // an opt-in comparison measurable.
+            log.info("stream.firstToken", {
+              ms: Date.now() - attemptStartedAt,
+              cachePoints: useCachePoints,
+              historyLen: history.length,
+            });
+          }
 
           if (log.isUnsafeDebugPayloadEnabled() && events.length > 0) {
             for (const ev of events) {
