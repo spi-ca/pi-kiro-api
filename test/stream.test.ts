@@ -33,6 +33,52 @@ async function withImmediateTimers<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+}
+
+async function withFakeClock<T>(run: (clock: { advance: (ms: number) => void }) => Promise<T>): Promise<T> {
+  const originalDateNow = Date.now;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  let now = 0;
+  let nextTimerId = 0;
+  const timers = new Map<number, { callback: TimerHandler; args: unknown[]; dueAt: number }>();
+
+  Date.now = () => now;
+  globalThis.setTimeout = ((callback: TimerHandler, ms = 0, ...args: unknown[]) => {
+    const id = nextTimerId++;
+    timers.set(id, { callback, args, dueAt: now + ms });
+    return id as unknown as ReturnType<typeof setTimeout>;
+  }) as unknown as typeof setTimeout;
+  globalThis.clearTimeout = ((id: ReturnType<typeof setTimeout>) => {
+    timers.delete(id as unknown as number);
+  }) as typeof clearTimeout;
+
+  try {
+    return await run({
+      advance(ms) {
+        const target = now + ms;
+        while (true) {
+          const next = [...timers.entries()]
+            .filter(([, timer]) => timer.dueAt <= target)
+            .sort(([, a], [, b]) => a.dueAt - b.dueAt)[0];
+          if (!next) break;
+          const [id, timer] = next;
+          now = timer.dueAt;
+          timers.delete(id);
+          if (typeof timer.callback === "function") timer.callback(...timer.args);
+        }
+        now = target;
+      },
+    });
+  } finally {
+    Date.now = originalDateNow;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+}
+
 test("a retried stream emits one start and one terminal done event", async () => {
   const originalFetch = globalThis.fetch;
   const originalSetTimeout = globalThis.setTimeout;
@@ -90,6 +136,151 @@ test("retries framing-only bytes before a Kiro event", async () => {
     expect(fetchCalls).toBeGreaterThan(1);
     expect(events.filter((event) => event.type === "start")).toHaveLength(1);
     expect(["done", "error"]).toContain(String(events.at(-1)?.type));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("does not extend the first-token deadline for framing-only chunks", async () => {
+  const originalFetch = globalThis.fetch;
+  const noise = new Uint8Array([0x00, 0x01, 0x02, 0xff]);
+  let fetchCalls = 0;
+  let reads = 0;
+  let resolveRead: ((result: { done: boolean; value?: Uint8Array }) => void) | undefined;
+  let resolveReadStarted: (() => void) | undefined;
+  let cancelled = false;
+  const readStarted = (target: number) =>
+    new Promise<void>((resolve) => {
+      if (reads >= target) resolve();
+      else resolveReadStarted = resolve;
+    });
+
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    if (fetchCalls > 1) {
+      return new Response('{"content":"after deadline"}{"contextUsagePercentage":1}', { status: 200 });
+    }
+    return {
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: () => {
+            reads++;
+            resolveReadStarted?.();
+            return new Promise<{ done: boolean; value?: Uint8Array }>((resolve) => {
+              resolveRead = resolve;
+            });
+          },
+          cancel: async () => {
+            cancelled = true;
+          },
+        }),
+      },
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withFakeClock(async (clock) => {
+      const eventsPromise = collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
+      await readStarted(1);
+      for (let chunk = 1; chunk <= 4; chunk++) {
+        clock.advance(20_000);
+        resolveRead!({ done: false, value: noise });
+        await readStarted(chunk + 1);
+      }
+
+      clock.advance(10_000);
+      await flushMicrotasks();
+      expect(cancelled).toBe(true);
+      clock.advance(1_000);
+      return await eventsPromise;
+    });
+
+    expect(fetchCalls).toBe(2);
+    expect(events.filter((event) => event.type === "start")).toHaveLength(1);
+    expect(events.at(-1)?.type).toBe("done");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("retries with a fresh first-token deadline before accepting a Kiro event", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let fetchCalls = 0;
+  let firstAttemptCancelled = false;
+  let secondAttemptCancelled = false;
+  let resolveFirstReadStarted: (() => void) | undefined;
+  let resolveSecondReadStarted: (() => void) | undefined;
+  let resolveSecondRead: ((result: { done: boolean; value?: Uint8Array }) => void) | undefined;
+  const firstReadStarted = new Promise<void>((resolve) => {
+    resolveFirstReadStarted = resolve;
+  });
+  const secondReadStarted = new Promise<void>((resolve) => {
+    resolveSecondReadStarted = resolve;
+  });
+
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    if (fetchCalls === 1) {
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: () => {
+              resolveFirstReadStarted?.();
+              return new Promise<{ done: boolean; value?: Uint8Array }>(() => {});
+            },
+            cancel: async () => {
+              firstAttemptCancelled = true;
+            },
+          }),
+        },
+      } as unknown as Response;
+    }
+
+    let reads = 0;
+    return {
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: () => {
+            reads++;
+            if (reads > 1) return Promise.resolve({ done: true });
+            resolveSecondReadStarted?.();
+            return new Promise<{ done: boolean; value?: Uint8Array }>((resolve) => {
+              resolveSecondRead = resolve;
+            });
+          },
+          cancel: async () => {
+            secondAttemptCancelled = true;
+          },
+        }),
+      },
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withFakeClock(async (clock) => {
+      const eventsPromise = collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
+      await firstReadStarted;
+      clock.advance(90_000);
+      await flushMicrotasks();
+      expect(firstAttemptCancelled).toBe(true);
+      clock.advance(1_000);
+      await secondReadStarted;
+
+      clock.advance(89_999);
+      await flushMicrotasks();
+      expect(secondAttemptCancelled).toBe(false);
+      resolveSecondRead!({ done: false, value: encoder.encode('{"content":"fresh deadline"}') });
+      return await eventsPromise;
+    });
+
+    expect(fetchCalls).toBe(2);
+    expect(events.at(-1)?.type).toBe("done");
+    const terminal = events.at(-1) as unknown as { message: { content: Array<{ type: string; text?: string }> } };
+    expect(terminal.message.content).toEqual([expect.objectContaining({ type: "text", text: "fresh deadline" })]);
   } finally {
     globalThis.fetch = originalFetch;
   }
