@@ -69,6 +69,35 @@ describe("Kiro model discovery", () => {
     expect(toKiroModelId("unrelated-9-9")).toBe("unrelated-9.9");
   });
 
+  test("preserves non-reasoning catalog entries while defaulting unknown models to reasoning", async () => {
+    const models = await withMockFetch(
+      async () =>
+        new Response(
+          JSON.stringify({
+            models: [
+              { modelId: "claude-haiku-4.5", supportedInputTypes: ["TEXT"] },
+              { modelId: "claude-sonnet-4.6", supportedInputTypes: ["TEXT"] },
+              { modelId: "brand-new-model", supportedInputTypes: ["TEXT"] },
+            ],
+          }),
+          { status: 200 },
+        ),
+      () => discoverKiroModels("ksk_test-key", BASE_URL),
+    );
+
+    const haiku = models.find((model) => model.id === "claude-haiku-4-5");
+    expect(haiku).toEqual(expect.objectContaining({ reasoning: false }));
+    expect(haiku).not.toHaveProperty("thinkingLevelMap");
+
+    const sonnet = models.find((model) => model.id === "claude-sonnet-4-6");
+    expect(sonnet).toEqual(expect.objectContaining({ reasoning: true }));
+    expect(sonnet).toHaveProperty("thinkingLevelMap");
+
+    const unknown = models.find((model) => model.id === "brand-new-model");
+    expect(unknown).toEqual(expect.objectContaining({ reasoning: true }));
+    expect(unknown).toHaveProperty("thinkingLevelMap");
+  });
+
   test("is pure: discovery does not publish a catalog or allowlist", async () => {
     const provider = createKiroProvider();
     await withMockFetch(

@@ -135,6 +135,14 @@ reasoning capability. Reasoning strength therefore travels as a
 `<max_thinking_length>` hint prepended to the system prompt, which is advisory
 rather than an enforced limit.
 
+Since `ListAvailableModels` reports nothing about reasoning, a discovered model
+defaults to reasoning-capable. Models known not to reason are corrected from
+this provider's static catalog: `claude-haiku-4-5`, `minimax-m2-5`,
+`minimax-m2-1`, and `glm-4-7-flash` get no thinking directive and no level
+ladder. A model absent from that catalog keeps the reasoning-capable default,
+since an unnecessary directive costs less than suppressing reasoning on a model
+that supports it.
+
 Reasoning-capable models carry a `thinkingLevelMap` whose values are those
 token budgets:
 
