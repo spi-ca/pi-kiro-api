@@ -102,10 +102,25 @@ new lookup, and a failed lookup remains empty for that new scope. The old
 persisted entry is not deleted preemptively, but its digest prevents it from
 being reused by the new scope.
 
-Kiro also accepts a derived `-1m` long-context companion (for example,
-`claude-sonnet-4.6-1m`) when its discovered base model is available, even
-though that literal companion may not be returned by `ListAvailableModels`.
-No other static IDs are added.
+### Long-context `-1m` companions
+
+Two ID forms are in play. Kiro's wire IDs use dots (`claude-sonnet-4.6`);
+Pi exposes the dashed form (`claude-sonnet-4-6`). Everything you type — `/model`
+selection and `modelOverrides` keys in `models.json` — uses the **dashed Pi
+form**.
+
+Kiro accepts a derived `-1m` long-context companion even though
+`ListAvailableModels` does not return it. A companion is added only when both
+of these hold:
+
+1. It appears in this provider's static catalog (`src/kiro/models.ts`), and
+2. discovery confirmed its base model for the active key.
+
+The currently derivable companions are `claude-opus-4-6-1m`,
+`claude-sonnet-4-6-1m`, `claude-sonnet-4-5-1m`, and `agi-nova-beta-1m`. A `-1m`
+suffix is not synthesized for arbitrary discovered models, and no other static
+IDs are added — the entitlement boundary from `ListAvailableModels` is
+otherwise preserved exactly.
 
 ## Thinking levels
 
