@@ -376,6 +376,64 @@ test("sanitizes cross-provider history before sending Kiro request body", async 
   }
 });
 
+test("reports malformed tool call arguments without discarding preceding text", async () => {
+  const originalFetch = globalThis.fetch;
+  const malformedInput = '{"q":';
+  globalThis.fetch = (async () =>
+    new Response(
+      '{"content":"visible text"}{"name":"lookup","toolUseId":"call-1","input":"{\\"q\\":","stop":true}',
+      { status: 200 },
+    )) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      error: {
+        stopReason: string;
+        errorMessage: string;
+        content: Array<{ type: string; text?: string }>;
+      };
+    };
+
+    expect(terminal.type).toBe("error");
+    expect(terminal.error.stopReason).toBe("error");
+    expect(terminal.error.errorMessage).toContain('tool "lookup" returned malformed JSON arguments');
+    expect(terminal.error.errorMessage).not.toContain(malformedInput);
+    expect(terminal.error.content).toEqual([expect.objectContaining({ type: "text", text: "visible text" })]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("accepts empty tool call arguments as an empty object", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      '{"name":"lookup","toolUseId":"call-1","input":"   ","stop":true}{"contextUsagePercentage":10}',
+      { status: 200 },
+    )) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      message: { content: Array<{ type: string; name?: string; id?: string; arguments?: unknown }> };
+    };
+
+    expect(terminal.type).toBe("done");
+    expect(terminal.message.content).toEqual([
+      expect.objectContaining({ type: "toolCall", name: "lookup", id: "call-1", arguments: {} }),
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("does not retry after externally visible provider text or tool output", async () => {
   const cases = [
     {

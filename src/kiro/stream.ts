@@ -200,21 +200,37 @@ interface KiroToolCallState {
   input: string;
 }
 
+/**
+ * Emit a completed tool call, or return the reason it could not be emitted.
+ *
+ * Returns `null` on success and a short, payload-free reason on failure. A
+ * malformed tool call must not be swallowed: the model asked to act, and
+ * reporting `stop` instead would tell the caller the turn finished normally.
+ */
 function emitToolCall(
   state: KiroToolCallState,
   output: AssistantMessage,
   stream: AssistantMessageEventStream,
-): boolean {
+): string | null {
   if (!state.input.trim()) state.input = "{}";
 
   let args: Record<string, unknown>;
   try {
     args = JSON.parse(state.input) as Record<string, unknown>;
   } catch (e) {
-    log.warn(
-      `failed to parse tool input for "${state.name}" (${state.toolUseId}): ${e instanceof Error ? e.message : String(e)}`,
-    );
-    return false;
+    // The parse exception text can quote the offending input, so it stays
+    // behind the unsafe-payload gate like every other raw payload.
+    if (log.isUnsafeDebugPayloadEnabled()) {
+      log.debug("toolcall.parse.payload", {
+        toolUseId: state.toolUseId,
+        name: state.name,
+        input: state.input,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    const reason = `tool "${state.name}" returned malformed JSON arguments`;
+    log.warn(`${reason} (${state.toolUseId})`);
+    return reason;
   }
 
   const contentIndex = output.content.length;
@@ -223,7 +239,7 @@ function emitToolCall(
   stream.push({ type: "toolcall_start", contentIndex, partial: output });
   stream.push({ type: "toolcall_delta", contentIndex, delta: state.input, partial: output });
   stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
-  return true;
+  return null;
 }
 
 // ---- Main entry --------------------------------------------------------
@@ -579,9 +595,16 @@ export function streamKiro(
         let emittedToolCalls = 0;
         let sawAnyToolCalls = false;
         let currentToolCall: KiroToolCallState | null = null;
+        // A tool call the model intended but whose arguments could not be
+        // parsed. Recorded rather than dropped so the turn fails loudly
+        // instead of reporting a normal stop with a missing action.
+        let toolCallError: string | null = null;
         const flushToolCall = () => {
           if (!currentToolCall) return;
-          if (emitToolCall(currentToolCall, output, stream)) {
+          const failure = emitToolCall(currentToolCall, output, stream);
+          if (failure) {
+            toolCallError ??= failure;
+          } else {
             emittedToolCalls++;
             providerContentEmitted = true;
           }
@@ -839,7 +862,7 @@ export function streamKiro(
           closeHiddenBreadcrumb();
         }
 
-        if (currentToolCall && emitToolCall(currentToolCall, output, stream)) emittedToolCalls++;
+        flushToolCall();
         if (thinkingParser) {
           thinkingParser.finalize();
           textBlockIndex = thinkingParser.getTextBlockIndex();
@@ -856,6 +879,11 @@ export function streamKiro(
             });
           }
         }
+
+        // Raised only after the text block is closed, so the partial response
+        // stays balanced. Not retried: the caller is told the turn failed
+        // rather than receiving a `stop` that hides a dropped action.
+        if (toolCallError) throw new Error(`Kiro API error: ${toolCallError}`);
 
         if (usageEvent?.inputTokens !== undefined) output.usage.input = usageEvent.inputTokens;
         output.usage.output = usageEvent?.outputTokens ?? countTokens(totalContent);
