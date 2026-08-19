@@ -37,7 +37,9 @@ async function flushMicrotasks(): Promise<void> {
   for (let i = 0; i < 5; i++) await Promise.resolve();
 }
 
-async function withFakeClock<T>(run: (clock: { advance: (ms: number) => void }) => Promise<T>): Promise<T> {
+async function withFakeClock<T>(
+  run: (clock: { advance: (ms: number) => void; pending: () => number }) => Promise<T>,
+): Promise<T> {
   const originalDateNow = Date.now;
   const originalSetTimeout = globalThis.setTimeout;
   const originalClearTimeout = globalThis.clearTimeout;
@@ -70,6 +72,9 @@ async function withFakeClock<T>(run: (clock: { advance: (ms: number) => void }) 
           if (typeof timer.callback === "function") timer.callback(...timer.args);
         }
         now = target;
+      },
+      pending() {
+        return timers.size;
       },
     });
   } finally {
@@ -104,6 +109,408 @@ test("a retried stream emits one start and one terminal done event", async () =>
   } finally {
     globalThis.fetch = originalFetch;
     globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("times out stalled fetches before headers and clears deadline timers", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    if (fetchCalls === 1) return new Promise<Response>(() => {});
+    return new Response('{"content":"after headers"}{"contextUsagePercentage":1}', { status: 200 });
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withFakeClock(async (clock) => {
+      const eventsPromise = collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
+      await flushMicrotasks();
+      clock.advance(90_000);
+      await flushMicrotasks();
+      clock.advance(1_000);
+      const result = await eventsPromise;
+      expect(clock.pending()).toBe(0);
+      return result;
+    });
+
+    expect(fetchCalls).toBe(2);
+    expect(events.at(-1)?.type).toBe("done");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("cleans attempt deadlines when response body acquisition throws synchronously", async () => {
+  const originalFetch = globalThis.fetch;
+
+  try {
+    for (const failurePoint of ["body", "getReader"] as const) {
+      const controller = new AbortController();
+      const signal = controller.signal;
+      const originalAddEventListener = signal.addEventListener;
+      const originalRemoveEventListener = signal.removeEventListener;
+      let abortListenersAdded = 0;
+      let abortListenersRemoved = 0;
+      signal.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) => {
+        if (type === "abort") abortListenersAdded++;
+        return originalAddEventListener.call(signal, type, listener, options);
+      }) as typeof signal.addEventListener;
+      signal.removeEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: boolean | EventListenerOptions) => {
+        if (type === "abort") abortListenersRemoved++;
+        return originalRemoveEventListener.call(signal, type, listener, options);
+      }) as typeof signal.removeEventListener;
+      globalThis.fetch = (async () =>
+        ({
+          ok: true,
+          get body() {
+            if (failurePoint === "body") throw new Error("body getter exploded");
+            return {
+              getReader() {
+                if (failurePoint === "getReader") throw new Error("getReader exploded");
+                throw new Error("unreachable");
+              },
+            };
+          },
+        }) as unknown as Response) as unknown as typeof fetch;
+
+      try {
+        await withFakeClock(async (clock) => {
+          const events = await collectEvents(
+            streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key", signal }),
+          );
+          expect(events.at(-1)).toEqual(expect.objectContaining({ type: "error" }));
+          // The first-event timer was armed before fetch and must be removed
+          // even when either synchronous getter throws.
+          expect(clock.pending()).toBe(0);
+        });
+        expect(abortListenersAdded).toBe(1);
+        expect(abortListenersRemoved).toBe(1);
+      } finally {
+        signal.addEventListener = originalAddEventListener;
+        signal.removeEventListener = originalRemoveEventListener;
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("removes retry-delay abort listeners after a successful timer", async () => {
+  const originalFetch = globalThis.fetch;
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const originalAddEventListener = signal.addEventListener;
+  const originalRemoveEventListener = signal.removeEventListener;
+  let added = 0;
+  let removed = 0;
+  signal.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) => {
+    if (type === "abort") added++;
+    return originalAddEventListener.call(signal, type, listener, options);
+  }) as typeof signal.addEventListener;
+  signal.removeEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: boolean | EventListenerOptions) => {
+    if (type === "abort") removed++;
+    return originalRemoveEventListener.call(signal, type, listener, options);
+  }) as typeof signal.removeEventListener;
+
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    return new Response(
+      fetchCalls === 1 ? "" : '{"content":"after retry"}{"contextUsagePercentage":1}',
+      { status: 200 },
+    );
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withFakeClock(async (clock) => {
+      const eventsPromise = collectEvents(
+        streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key", signal }),
+      );
+      await flushMicrotasks();
+      clock.advance(1_000);
+      await flushMicrotasks();
+      return await eventsPromise;
+    });
+
+    // Two first-event deadlines and one successful retry delay each attach
+    // and remove exactly one listener.
+    expect(fetchCalls).toBe(2);
+    expect(added).toBe(3);
+    expect(removed).toBe(3);
+    expect(events.at(-1)?.type).toBe("done");
+  } finally {
+    signal.addEventListener = originalAddEventListener;
+    signal.removeEventListener = originalRemoveEventListener;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("preserves caller aborts during a stalled pre-header request", async () => {
+  const originalFetch = globalThis.fetch;
+  const controller = new AbortController();
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    return new Promise<Response>(() => {});
+  }) as unknown as typeof fetch;
+
+  try {
+    const eventsPromise = collectEvents(
+      streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key", signal: controller.signal }),
+    );
+    await flushMicrotasks();
+    controller.abort(new Error("caller stopped request"));
+    const events = await eventsPromise;
+
+    expect(fetchCalls).toBe(1);
+    expect(events.at(-1)).toEqual(expect.objectContaining({ type: "error", reason: "aborted" }));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("preserves caller aborts after the first event", async () => {
+  const originalFetch = globalThis.fetch;
+  const controller = new AbortController();
+  const encoder = new TextEncoder();
+  let cancelled = false;
+  let reads = 0;
+  let secondReadStarted: (() => void) | undefined;
+  const secondRead = new Promise<void>((resolve) => {
+    secondReadStarted = resolve;
+  });
+  globalThis.fetch = (async () =>
+    ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: async () => {
+            reads++;
+            if (reads === 1) return { done: false, value: encoder.encode('{"content":"visible"}') };
+            secondReadStarted?.();
+            return new Promise<never>(() => {});
+          },
+          cancel: async () => {
+            cancelled = true;
+          },
+        }),
+      },
+    }) as unknown as Response) as unknown as typeof fetch;
+
+  try {
+    const eventsPromise = collectEvents(
+      streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key", signal: controller.signal }),
+    );
+    await secondRead;
+    controller.abort(new Error("caller stopped after first event"));
+    const events = await eventsPromise;
+
+    expect(cancelled).toBe(true);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "text_delta", delta: "visible" }),
+        expect.objectContaining({ type: "error", reason: "aborted" }),
+      ]),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("settles post-first-event idle timeout when reader cancellation never settles", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let reads = 0;
+  let cancelCalls = 0;
+  let secondReadStarted: (() => void) | undefined;
+  const secondRead = new Promise<void>((resolve) => {
+    secondReadStarted = resolve;
+  });
+  globalThis.fetch = (async () =>
+    ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: () => {
+            reads++;
+            if (reads === 1) return Promise.resolve({ done: false, value: encoder.encode('{"content":"visible"}') });
+            secondReadStarted?.();
+            return new Promise<never>(() => {});
+          },
+          // Deliberately non-conforming: neither cancel nor the pending read
+          // resolve. The idle deadline must still settle the stream.
+          cancel: () => {
+            cancelCalls++;
+            return new Promise<never>(() => {});
+          },
+        }),
+      },
+    }) as unknown as Response) as unknown as typeof fetch;
+
+  try {
+    const events = await withFakeClock(async (clock) => {
+      const eventsPromise = collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
+      await secondRead;
+      clock.advance(300_000);
+      await flushMicrotasks();
+      const result = await eventsPromise;
+      expect(clock.pending()).toBe(0);
+      return result;
+    });
+
+    expect(cancelCalls).toBe(1);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "text_delta", delta: "visible" }),
+        expect.objectContaining({ type: "error", reason: "error" }),
+      ]),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("does not reset idle timeout for repeated zero-byte reads", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let reads = 0;
+  let cancelCalls = 0;
+  let resolveRead: ((result: { done: boolean; value?: Uint8Array }) => void) | undefined;
+  let resolveReadStarted: (() => void) | undefined;
+  const readStarted = (target: number) =>
+    new Promise<void>((resolve) => {
+      if (reads >= target) resolve();
+      else resolveReadStarted = resolve;
+    });
+
+  globalThis.fetch = (async () => ({
+    ok: true,
+    body: {
+      getReader: () => ({
+        read: () => {
+          reads++;
+          if (reads === 1) return Promise.resolve({ done: false, value: encoder.encode('{"content":"visible"}') });
+          resolveReadStarted?.();
+          return new Promise<{ done: boolean; value?: Uint8Array }>((resolve) => {
+            resolveRead = resolve;
+          });
+        },
+        cancel: async () => {
+          cancelCalls++;
+        },
+      }),
+    },
+  }) as unknown as Response) as unknown as typeof fetch;
+
+  try {
+    const events = await withFakeClock(async (clock) => {
+      const eventsPromise = collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
+      await readStarted(2);
+      // Each zero-byte read starts the next read, but none may move the
+      // deadline armed by the initial content event.
+      for (let i = 0; i < 3; i++) {
+        resolveRead!({ done: false, value: new Uint8Array() });
+        await readStarted(3 + i);
+      }
+      clock.advance(300_000);
+      await flushMicrotasks();
+      const result = await eventsPromise;
+      expect(clock.pending()).toBe(0);
+      return result;
+    });
+
+    expect(cancelCalls).toBe(1);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "text_delta", delta: "visible" }),
+        expect.objectContaining({ type: "error", reason: "error" }),
+      ]),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("yields immediate empty reads so the first-event deadline can settle", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  let reads = 0;
+  let cancelCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    return {
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: () => {
+            reads++;
+            return Promise.resolve({ done: false, value: new Uint8Array() });
+          },
+          cancel: async () => {
+            cancelCalls++;
+          },
+        }),
+      },
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withImmediateTimers(() =>
+      collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" })),
+    );
+
+    // The reader resolved synchronously thousands of times in the old loop,
+    // preventing its deadline timer from firing at all.
+    expect(reads).toBeGreaterThanOrEqual(64);
+    expect(fetchCalls).toBe(4);
+    expect(cancelCalls).toBe(4);
+    expect(events.at(-1)).toEqual(expect.objectContaining({ type: "error", reason: "error" }));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("times out stalled non-OK bodies before reading unbounded error data", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  let cancelled = false;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    if (fetchCalls > 1) {
+      return new Response('{"content":"after error body"}{"contextUsagePercentage":1}', { status: 200 });
+    }
+    return {
+      ok: false,
+      status: 503,
+      statusText: "Unavailable",
+      body: {
+        getReader: () => ({
+          read: () => new Promise<never>(() => {}),
+          cancel: async () => {
+            cancelled = true;
+          },
+        }),
+      },
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await withFakeClock(async (clock) => {
+      const eventsPromise = collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
+      await flushMicrotasks();
+      clock.advance(90_000);
+      await flushMicrotasks();
+      expect(cancelled).toBe(true);
+      clock.advance(1_000);
+      const result = await eventsPromise;
+      expect(clock.pending()).toBe(0);
+      return result;
+    });
+
+    expect(fetchCalls).toBe(2);
+    expect(events.at(-1)?.type).toBe("done");
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -768,6 +1175,87 @@ test("does not echo a hostile tool name into logs or the error message", async (
     expect(terminal.error.errorMessage).not.toContain("\n");
     expect(terminal.error.errorMessage).not.toContain("\u001b");
     expect(terminal.error.errorMessage).not.toContain("forged");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("cancels the reader when parser finalization rejects an incomplete event", async () => {
+  const originalFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let reads = 0;
+  let cancelCalls = 0;
+  globalThis.fetch = (async () =>
+    ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: () => {
+            reads++;
+            return Promise.resolve(
+              reads === 1
+                ? { done: false, value: encoder.encode('{"content":"partial') }
+                : { done: true },
+            );
+          },
+          cancel: async () => {
+            cancelCalls++;
+          },
+        }),
+      },
+    }) as unknown as Response) as unknown as typeof fetch;
+
+  try {
+    const events = await collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
+    expect(cancelCalls).toBe(1);
+    expect(events.at(-1)).toEqual(
+      expect.objectContaining({ type: "error", reason: "error", error: expect.objectContaining({ errorMessage: expect.stringContaining("incomplete event") }) }),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects a recognized incomplete event at EOF without retrying", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    return new Response('{"content":"partial', { status: 200 });
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
+    const terminal = events.at(-1) as unknown as { type: string; error: { errorMessage: string } };
+
+    expect(fetchCalls).toBe(1);
+    expect(terminal.type).toBe("error");
+    expect(terminal.error.errorMessage).toContain("incomplete event");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("does not emit a tool call when EOF arrives before its stop", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    return new Response('{"name":"lookup","toolUseId":"call-1","input":"{}"}', { status: 200 });
+  }) as unknown as typeof fetch;
+
+  try {
+    const events = await collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
+    const terminal = events.at(-1) as unknown as {
+      type: string;
+      error: { errorMessage: string; content: Array<{ type: string }> };
+    };
+
+    expect(fetchCalls).toBe(1);
+    expect(terminal.type).toBe("error");
+    expect(terminal.error.errorMessage).toContain("tool call ended before provider sent stop");
+    expect(terminal.error.content.filter((block) => block.type === "toolCall")).toHaveLength(0);
+    expect(events.filter((event) => event.type === "toolcall_end")).toHaveLength(0);
   } finally {
     globalThis.fetch = originalFetch;
   }

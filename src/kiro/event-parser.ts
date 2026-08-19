@@ -143,12 +143,16 @@ const EVENT_PATTERNS = [
 ];
 
 function findNextEventStart(buffer: string, from: number): number {
-  let earliest = -1;
-  for (const pattern of EVENT_PATTERNS) {
-    const idx = buffer.indexOf(pattern, from);
-    if (idx >= 0 && (earliest < 0 || idx < earliest)) earliest = idx;
+  // Searching each pattern independently scans the remaining suffix once per
+  // pattern. With many small concatenated events that becomes quadratic. Scan
+  // for the common `{"` introducer once instead, then test the bounded set of
+  // known prefixes at that position.
+  let candidate = buffer.indexOf('{"', from);
+  while (candidate >= 0) {
+    if (EVENT_PATTERNS.some((pattern) => buffer.startsWith(pattern, candidate))) return candidate;
+    candidate = buffer.indexOf('{"', candidate + 2);
   }
-  return earliest;
+  return -1;
 }
 
 /** Longest event prefix, so a split prefix can never be longer than this. */
@@ -164,95 +168,170 @@ const MAX_PATTERN_LENGTH = Math.max(...EVENT_PATTERNS.map((p) => p.length));
  * would silently truncate output or trigger an empty-response retry.
  */
 const MAX_RETAINED_BYTES = 1_048_576;
+/** Maximum retained text per open-event segment. */
+const SEGMENT_SLAB_BYTES = 4 * 1024;
 
 /** Raised when an unterminated event grows past {@link MAX_RETAINED_BYTES}. */
 export class KiroEventBufferOverflowError extends Error {
-  constructor(readonly retainedBytes: number) {
+  constructor(
+    readonly retainedBytes: number,
+    completed = false,
+  ) {
     super(
-      `unterminated Kiro stream event exceeded ${MAX_RETAINED_BYTES} characters (retained ${retainedBytes})`,
+      `${completed ? "Kiro stream event" : "unterminated Kiro stream event"} exceeded ${MAX_RETAINED_BYTES} characters (retained ${retainedBytes})`,
     );
     this.name = "KiroEventBufferOverflowError";
   }
 }
 
-/**
- * Length of the tail to keep when no event prefix is present.
- *
- * A prefix can straddle a chunk boundary (`{\"cont` + `ent\":...`), so dropping
- * the whole remainder would lose the event. Keeping the last
- * `MAX_PATTERN_LENGTH - 1` characters is enough to complete any prefix on the
- * next chunk while still discarding framing noise.
- */
-function tailForSplitPrefix(buffer: string, from: number): string {
-  const gap = buffer.substring(from);
-  if (gap.length <= MAX_PATTERN_LENGTH - 1) return gap;
-  return gap.substring(gap.length - (MAX_PATTERN_LENGTH - 1));
+/** Raised when EOF cuts off an event whose prefix was recognized. */
+export class KiroIncompleteEventError extends Error {
+  constructor() {
+    super("Kiro stream ended with an incomplete event");
+    this.name = "KiroIncompleteEventError";
+  }
 }
 
-export function parseKiroEvents(
-  buffer: string,
-): { events: KiroStreamEvent[]; remaining: string } {
-  const events: KiroStreamEvent[] = [];
-  let pos = 0;
+type EventSegment = { codeUnits: Uint16Array; length: number };
+type OpenEvent = {
+  segments: EventSegment[];
+  length: number;
+  braceCount: number;
+  inString: boolean;
+  escapeNext: boolean;
+};
 
-  while (pos < buffer.length) {
-    const jsonStart = findNextEventStart(buffer, pos);
-    if (jsonStart < 0) {
-      // No known event prefix in the remainder. If there are brace-opens
-      // sitting in the gap, surface them — that's where an unrecognized
-      // top-level key would live.
-      if (log.isUnsafeDebugPayloadEnabled()) {
-        const gap = buffer.substring(pos);
-        const braceIdx = gap.indexOf('{"');
-        if (braceIdx >= 0) {
-          log.debug("event.unmatchedBrace", {
-            from: pos + braceIdx,
-            preview: gap.substring(braceIdx, Math.min(braceIdx + 200, gap.length)),
-          });
+/**
+ * Stateful incremental parser for Kiro's binary-framed event stream.
+ *
+ * An open JSON event keeps fixed-size UTF-16 slabs. New chunks are scanned
+ * exactly once using persisted JSON state, then the slabs are joined only
+ * after the closing brace arrives. Bytes outside an event retain only a
+ * bounded possible-prefix tail.
+ */
+export class KiroEventParser {
+  private splitPrefixTail = "";
+  private open: OpenEvent | null = null;
+  // Kept as deterministic regression instrumentation: an open event must not
+  // be assembled until it closes, and each completed event gets one join.
+  private completedEventJoinCount = 0;
+  private completedEventJoinedCharacters = 0;
+
+  push(chunk: string): KiroStreamEvent[] {
+    // Empty decoded chunks carry neither bytes nor characters. In particular,
+    // do not create an empty segment for an already-open event.
+    if (chunk.length === 0) return [];
+
+    const events: KiroStreamEvent[] = [];
+    let source: string;
+    let searchOffset: number;
+
+    if (this.open) {
+      source = chunk;
+      const jsonEnd = this.scanOpenSegment(source, 0);
+      if (jsonEnd < 0) return events;
+      this.dispatchCompletedEvent(events);
+      searchOffset = jsonEnd + 1;
+    } else {
+      // `splitPrefixTail` is bounded to less than the longest known prefix,
+      // so this is never a growing event-buffer append.
+      source = this.splitPrefixTail + chunk;
+      this.splitPrefixTail = "";
+      searchOffset = 0;
+    }
+
+    while (true) {
+      const jsonStart = findNextEventStart(source, searchOffset);
+      if (jsonStart < 0) {
+        this.logUnmatchedBrace(source, searchOffset);
+        this.retainSplitPrefix(source, searchOffset);
+        return events;
+      }
+
+      this.logSkippedBrace(source, searchOffset, jsonStart);
+      this.open = {
+        segments: [],
+        length: 0,
+        braceCount: 0,
+        inString: false,
+        escapeNext: false,
+      };
+      const jsonEnd = this.scanOpenSegment(source, jsonStart);
+      if (jsonEnd < 0) return events;
+      this.dispatchCompletedEvent(events);
+      searchOffset = jsonEnd + 1;
+    }
+  }
+
+  /** Finalize a response and reject a recognized event cut off by EOF. */
+  finish(): void {
+    if (this.open) throw new KiroIncompleteEventError();
+  }
+
+  /** The unconsumed suffix, retained for compatibility with parseKiroEvents. */
+  get remaining(): string {
+    if (this.open) return this.joinOpenEvent();
+    return this.splitPrefixTail;
+  }
+
+  /**
+   * Scan new source text once while copying each UTF-16 code unit directly
+   * into a fixed-size slab. `jsonEnd` remains an offset into `text`, so
+   * callers can continue finding events that follow a completion in the same
+   * source chunk.
+   */
+  private scanOpenSegment(text: string, start: number): number {
+    const open = this.open!;
+
+    for (let i = start; i < text.length; i++) {
+      const char = text[i];
+      open.length++;
+      let completed = false;
+      if (open.escapeNext) {
+        open.escapeNext = false;
+      } else if (char === "\\") {
+        open.escapeNext = true;
+      } else if (char === '"') {
+        open.inString = !open.inString;
+      } else if (!open.inString) {
+        if (char === "{") open.braceCount++;
+        else if (char === "}") {
+          open.braceCount--;
+          completed = open.braceCount === 0;
         }
       }
-      // Keep only enough of the tail to complete a prefix split across the
-      // chunk boundary; the rest is framing noise.
-      return { events, remaining: tailForSplitPrefix(buffer, pos) };
-    }
 
-    if (log.isUnsafeDebugPayloadEnabled() && jsonStart > pos) {
-      // Bytes skipped between pos and the next known event — usually binary
-      // framing, but worth peeking at once so we can tell.
-      const skipped = buffer.substring(pos, jsonStart);
-      const braceIdx = skipped.indexOf('{"');
-      if (braceIdx >= 0) {
-        log.debug("event.skippedBrace", {
-          from: pos + braceIdx,
-          preview: skipped.substring(braceIdx, Math.min(braceIdx + 200, skipped.length)),
-        });
+      if (open.length > MAX_RETAINED_BYTES) {
+        throw new KiroEventBufferOverflowError(open.length, completed);
       }
+      this.appendScannedCharacter(char);
+      if (completed) return i;
     }
+    return -1;
+  }
 
-    const jsonEnd = findJsonEnd(buffer, jsonStart);
-    if (jsonEnd < 0) {
-      // Incomplete JSON at end of buffer — preserve for next call, unless it
-      // has grown past the memory bound. Any events already parsed from this
-      // buffer are lost with the throw, but they would be an incomplete
-      // response either way; failing loudly beats a silent truncation.
-      const retained = buffer.substring(jsonStart);
-      if (retained.length > MAX_RETAINED_BYTES) {
-        throw new KiroEventBufferOverflowError(retained.length);
-      }
-      return { events, remaining: retained };
+  /** Store a scanned code unit without allocating a segment per tiny chunk. */
+  private appendScannedCharacter(char: string): void {
+    const segments = this.open!.segments;
+    let last = segments.at(-1);
+    if (!last || last.length === SEGMENT_SLAB_BYTES) {
+      last = { codeUnits: new Uint16Array(SEGMENT_SLAB_BYTES), length: 0 };
+      segments.push(last);
     }
+    last.codeUnits[last.length++] = char.charCodeAt(0);
+  }
 
+  private dispatchCompletedEvent(events: KiroStreamEvent[]): void {
+    const raw = this.joinOpenEvent();
+    this.completedEventJoinCount++;
+    this.completedEventJoinedCharacters += raw.length;
+    this.open = null;
     try {
-      const parsed = JSON.parse(buffer.substring(jsonStart, jsonEnd + 1)) as Record<
-        string,
-        unknown
-      >;
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
       const event = parseKiroEvent(parsed);
       if (event) {
         events.push(event);
       } else if (log.isUnsafeDebugPayloadEnabled()) {
-        // Frame parsed cleanly but didn't match any known event shape.
-        // This is the primary signal for a new upstream event type.
         log.debug("event.unknown", { keys: Object.keys(parsed), raw: parsed });
       }
     } catch (err) {
@@ -260,12 +339,54 @@ export function parseKiroEvents(
       if (log.isUnsafeDebugPayloadEnabled()) {
         log.debug("event.parseFail", {
           err: err instanceof Error ? err.message : String(err),
-          snippet: buffer.substring(jsonStart, Math.min(jsonEnd + 1, jsonStart + 200)),
+          snippet: raw.substring(0, 200),
         });
       }
     }
-    pos = jsonEnd + 1;
   }
 
-  return { events, remaining: "" };
+  /** Join retained slabs once after completion (or for the legacy remaining view). */
+  private joinOpenEvent(): string {
+    return this.open!.segments
+      .map((segment) => String.fromCharCode(...segment.codeUnits.subarray(0, segment.length)))
+      .join("");
+  }
+
+  private retainSplitPrefix(source: string, from: number): void {
+    const gap = source.substring(from);
+    this.splitPrefixTail =
+      gap.length <= MAX_PATTERN_LENGTH - 1 ? gap : gap.substring(gap.length - (MAX_PATTERN_LENGTH - 1));
+  }
+
+  private logUnmatchedBrace(source: string, from: number): void {
+    if (!log.isUnsafeDebugPayloadEnabled()) return;
+    const braceIdx = source.indexOf('{"', from);
+    if (braceIdx >= 0) {
+      log.debug("event.unmatchedBrace", {
+        from: braceIdx,
+        preview: source.substring(braceIdx, Math.min(braceIdx + 200, source.length)),
+      });
+    }
+  }
+
+  private logSkippedBrace(source: string, from: number, to: number): void {
+    if (!log.isUnsafeDebugPayloadEnabled() || to <= from) return;
+    const braceIdx = source.indexOf('{"', from);
+    if (braceIdx >= 0 && braceIdx < to) {
+      log.debug("event.skippedBrace", {
+        from: braceIdx,
+        preview: source.substring(braceIdx, Math.min(braceIdx + 200, to)),
+      });
+    }
+  }
+}
+
+/**
+ * Stateless compatibility wrapper for existing callers. Stream consumers
+ * should keep one {@link KiroEventParser} and call push for each decoded chunk.
+ */
+export function parseKiroEvents(buffer: string): { events: KiroStreamEvent[]; remaining: string } {
+  const parser = new KiroEventParser();
+  const events = parser.push(buffer);
+  return { events, remaining: parser.remaining };
 }
