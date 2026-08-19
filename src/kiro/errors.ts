@@ -2,7 +2,11 @@ const MAX_ERROR_BODY_BYTES = 4_096;
 const MAX_ERROR_CODE_LENGTH = 120;
 
 /** Read no more than `limit` bytes so error handling cannot buffer an attacker-controlled body. */
-export async function readResponseTextBounded(response: Response, limit = MAX_ERROR_BODY_BYTES): Promise<string> {
+export async function readResponseTextBounded(
+  response: Response,
+  limit = MAX_ERROR_BODY_BYTES,
+  signal?: AbortSignal,
+): Promise<string> {
   const reader = response.body?.getReader();
   if (!reader) return "";
 
@@ -10,7 +14,7 @@ export async function readResponseTextBounded(response: Response, limit = MAX_ER
   let bytes = 0;
   try {
     while (bytes < limit) {
-      const { done, value } = await reader.read();
+      const { done, value } = await awaitWithAbort(reader.read(), signal);
       if (done) break;
       const remaining = limit - bytes;
       const chunk = value.byteLength > remaining ? value.slice(0, remaining) : value;
@@ -19,7 +23,9 @@ export async function readResponseTextBounded(response: Response, limit = MAX_ER
       if (chunk.byteLength < value.byteLength) break;
     }
   } finally {
-    await reader.cancel().catch(() => {});
+    // Do not await cancellation here: a non-conforming or stalled body must
+    // not outlive the caller's request deadline.
+    void reader.cancel().catch(() => {});
   }
 
   const joined = new Uint8Array(bytes);
@@ -29,6 +35,30 @@ export async function readResponseTextBounded(response: Response, limit = MAX_ER
     offset += chunk.byteLength;
   }
   return new TextDecoder().decode(joined);
+}
+
+function awaitWithAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return operation;
+  if (signal.aborted) return Promise.reject(signal.reason);
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void operation.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 /** Accept only compact provider identifiers, never arbitrary service prose. */

@@ -33,7 +33,7 @@ import {
   sanitizeKiroError,
   sanitizeKiroStreamEventError,
 } from "./errors.ts";
-import { parseKiroEvents } from "./event-parser.ts";
+import { KiroEventParser } from "./event-parser.ts";
 import type { KiroModel } from "./models.ts";
 import { kiroModels, toKiroModelId } from "./models.ts";
 import { ThinkingTagParser } from "./thinking-parser.ts";
@@ -65,6 +65,8 @@ const FIRST_TOKEN_TIMEOUT_DEFAULT_MS = 90_000;
 const IDLE_TIMEOUT_MS = 300_000;
 const MAX_RETRIES = 3;
 const MAX_RETRY_DELAY_MS = 10_000;
+/** Yield after this many immediate empty reads so deadline timers can run. */
+const MAX_CONSECUTIVE_ZERO_PROGRESS_READS = 64;
 
 const CAPACITY_MAX_RETRIES = 3;
 
@@ -103,6 +105,79 @@ function isCapacityError(body: string): boolean {
 function firstTokenTimeoutForModel(modelId: string): number {
   const m = kiroModels.find((x) => x.id === modelId) as KiroModel | undefined;
   return m?.firstTokenTimeout ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
+}
+
+class FirstEventDeadlineExceeded extends Error {
+  constructor() {
+    super("first event deadline exceeded");
+    this.name = "FirstEventDeadlineExceeded";
+  }
+}
+
+class IdleDeadlineExceeded extends Error {
+  constructor() {
+    super("stream idle deadline exceeded");
+    this.name = "IdleDeadlineExceeded";
+  }
+}
+
+/**
+ * A per-transport-attempt deadline that begins before fetch. It deliberately
+ * relays the caller signal rather than replacing it, so external cancellation
+ * remains observable as an aborted request rather than a timeout.
+ */
+function createFirstEventDeadline(timeoutMs: number, externalSignal?: AbortSignal) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const relayExternalAbort = () => controller.abort(externalSignal?.reason);
+  if (externalSignal?.aborted) relayExternalAbort();
+  else externalSignal?.addEventListener("abort", relayExternalAbort, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new FirstEventDeadlineExceeded());
+  }, timeoutMs);
+
+  return {
+    signal: controller.signal,
+    get timedOut() {
+      return timedOut;
+    },
+    // The first-event deadline ends at the first parsed event, but the
+    // caller's abort must remain connected until this attempt is finished.
+    disarm() {
+      clearTimeout(timer);
+    },
+    abort(reason: unknown) {
+      controller.abort(reason);
+    },
+    cleanup() {
+      clearTimeout(timer);
+      externalSignal?.removeEventListener("abort", relayExternalAbort);
+    },
+  };
+}
+
+function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void operation.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 /**
@@ -170,15 +245,20 @@ function closeHiddenReasoning(
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason);
-      },
-      { once: true },
-    );
+    let settled = false;
+    const onAbort = () => settle(() => reject(signal!.reason));
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const settle = (complete: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      complete();
+    };
+    const timer = setTimeout(() => settle(resolve), ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -501,11 +581,18 @@ export function streamKiro(
           }, HIDDEN_REASONING_COUNTDOWN_MS);
         }
 
-        let response!: Response;
+        let response: Response | undefined;
+        let firstEventDeadline: ReturnType<typeof createFirstEventDeadline> | undefined;
+        let firstEventStartedAt = 0;
+        let firstEventTimedOut = false;
         let capacityRetryCount = 0;
         while (true) {
           const mid = crypto.randomUUID().replace(/-/g, "");
           const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-${mid}`;
+          // Start this before fetch: waiting for response headers and a
+          // bounded non-OK body are part of time-to-first-event too.
+          firstEventStartedAt = Date.now();
+          firstEventDeadline = createFirstEventDeadline(firstTokenTimeoutForModel(model.id), options?.signal);
 
           log.debug("request.send", {
             attempt: retryCount,
@@ -516,34 +603,65 @@ export function streamKiro(
             toolResultCount: currentToolResults.length,
           });
 
-          response = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/x-amz-json-1.0",
-              Accept: "application/json",
-              Authorization: `Bearer ${apiKey}`,
-              tokentype: "API_KEY",
-              "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-              "x-amzn-codewhisperer-optout": "true",
-              "amz-sdk-invocation-id": crypto.randomUUID(),
-              "amz-sdk-request": "attempt=1; max=1",
-              "x-amzn-kiro-agent-mode": "vibe",
-              "x-amz-user-agent": ua,
-              "user-agent": ua,
-            },
-            body: JSON.stringify(request),
-            // Do not forward an API key if a service endpoint redirects.
-            redirect: "error",
-            signal: options?.signal,
-          });
+          try {
+            response = await awaitWithAbort(
+              fetch(endpoint, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-amz-json-1.0",
+                  Accept: "application/json",
+                  Authorization: `Bearer ${apiKey}`,
+                  tokentype: "API_KEY",
+                  "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+                  "x-amzn-codewhisperer-optout": "true",
+                  "amz-sdk-invocation-id": crypto.randomUUID(),
+                  "amz-sdk-request": "attempt=1; max=1",
+                  "x-amzn-kiro-agent-mode": "vibe",
+                  "x-amz-user-agent": ua,
+                  "user-agent": ua,
+                },
+                body: JSON.stringify(request),
+                // Do not forward an API key if a service endpoint redirects.
+                redirect: "error",
+                signal: firstEventDeadline.signal,
+              }),
+              firstEventDeadline.signal,
+            );
+          } catch (error) {
+            if (firstEventDeadline.timedOut) {
+              firstEventTimedOut = true;
+              break;
+            }
+            firstEventDeadline.cleanup();
+            throw error;
+          }
 
           if (response.ok) break;
 
-          const errText = await readResponseTextBounded(response).catch(() => "");
+          let errText: string;
+          try {
+            errText = await readResponseTextBounded(response, undefined, firstEventDeadline.signal);
+          } catch (error) {
+            if (firstEventDeadline.timedOut) {
+              firstEventTimedOut = true;
+              break;
+            }
+            // Preserve the prior bounded-error behavior for an ordinary body
+            // read failure, while letting a caller abort retain its reason.
+            if (options?.signal?.aborted) {
+              firstEventDeadline.cleanup();
+              throw error;
+            }
+            errText = "";
+          }
           if (log.isUnsafeDebugPayloadEnabled()) {
             log.debug("response.error.payload", { status: response.status, body: errText });
           }
           const safeError = sanitizeKiroError(response.status, response.statusText, errText);
+          // A non-OK response has completed this transport attempt; capacity
+          // retries get a fresh deadline when they issue their next fetch.
+          firstEventDeadline.cleanup();
+          firstEventDeadline = undefined;
 
           if (isCapacityError(errText) && capacityRetryCount < CAPACITY_MAX_RETRIES) {
             capacityRetryCount++;
@@ -573,16 +691,76 @@ export function streamKiro(
           throw new Error(`Kiro API error: ${safeError}`);
         }
 
+        if (firstEventTimedOut) {
+          firstEventDeadline?.cleanup();
+          if (retryCount < MAX_RETRIES) {
+            retryCount++;
+            const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
+            log.warn(`stream first-token timed out — retrying (${retryCount}/${MAX_RETRIES})`);
+            await abortableDelay(delayMs, options?.signal);
+            if (hiddenMarkerTimer) {
+              clearTimeout(hiddenMarkerTimer);
+              hiddenMarkerTimer = null;
+            }
+            if (hiddenThinkingIndex !== null) {
+              closeHiddenReasoning(output, stream, hiddenThinkingIndex);
+              hiddenThinkingIndex = null;
+            }
+            output.content = [];
+            continue;
+          }
+          throw new Error("Kiro API error: first token timeout after max retries");
+        }
+
         if (capacityRetryCount > 0) {
           log.info(`recovered from capacity pressure after ${capacityRetryCount} retries`);
         }
 
         // -- Consume response stream -------------------------------------
-        const reader = response.body?.getReader();
-        if (!reader) throw new Error("No response body");
+        // Both `body` and `getReader` are user-provided getters in mocked or
+        // non-conforming Response implementations. Keep their synchronous
+        // acquisition inside cleanup so either throw cannot leak this
+        // attempt's deadline timer or caller-abort listener.
+        let reader: ReadableStreamDefaultReader<Uint8Array>;
+        let finishAttemptDeadline: {
+          disarmFirstEventTimer(): void;
+          cancelReader(): void;
+          cleanup(): void;
+        };
+        try {
+          const body = response?.body;
+          const acquiredReader = body?.getReader();
+          if (!acquiredReader) throw new Error("No response body");
+          reader = acquiredReader;
+          finishAttemptDeadline = (() => {
+            let finished = false;
+            let readerCancelled = false;
+            const cancelReader = () => {
+              if (readerCancelled) return;
+              readerCancelled = true;
+              void reader.cancel().catch(() => {});
+            };
+            firstEventDeadline!.signal.addEventListener("abort", cancelReader, { once: true });
+            return {
+              disarmFirstEventTimer() {
+                firstEventDeadline!.disarm();
+              },
+              cancelReader,
+              cleanup() {
+                if (finished) return;
+                finished = true;
+                firstEventDeadline!.signal.removeEventListener("abort", cancelReader);
+                firstEventDeadline!.cleanup();
+              },
+            };
+          })();
+        } catch (error) {
+          firstEventDeadline?.cleanup();
+          throw error;
+        }
 
         const decoder = new TextDecoder();
-        let buffer = "";
+        const parser = new KiroEventParser();
         let totalContent = "";
         let sawContentEvent = false;
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
@@ -619,7 +797,7 @@ export function streamKiro(
             // transport outcome — a reader rejection, a timeout, an overflow —
             // would otherwise replace this reason with its own and hide the
             // dropped action again.
-            void reader.cancel().catch(() => {});
+            finishAttemptDeadline.cancelReader();
           } else {
             emittedToolCalls++;
             providerContentEmitted = true;
@@ -669,7 +847,10 @@ export function streamKiro(
           if (idleTimer) clearTimeout(idleTimer);
           idleTimer = setTimeout(() => {
             idleCancelled = true;
-            void reader.cancel().catch(() => {});
+            // Abort the pending read as well as cancelling the reader. Some
+            // non-conforming readers never settle read() after cancel(), so
+            // cancellation alone cannot make the attempt finish.
+            firstEventDeadline!.abort(new IdleDeadlineExceeded());
           }, IDLE_TIMEOUT_MS);
         };
         closeActiveAttempt = () => {
@@ -677,76 +858,39 @@ export function streamKiro(
             clearTimeout(idleTimer);
             idleTimer = null;
           }
+          // Exceptional exits (parser/tool failures and reader rejections)
+          // must not leave a locked body alive after reporting the error.
+          firstEventDeadline!.abort(new Error("stream attempt cancelled"));
+          finishAttemptDeadline.cancelReader();
+          finishAttemptDeadline.cleanup();
           closeOpenProviderBlocks();
         };
 
         // "First token" means the first *parsed event*, not the first bytes
-        // off the socket. Kiro wraps its JSON events in an AWS Event Stream
-        // envelope, so a stalled response can deliver framing bytes that
-        // contain no event. Treating those as a first token would retire the
-        // first-token guard and leave the request waiting for the much longer
-        // idle timeout.
-        //
-        // The deadline is absolute per attempt so that repeated framing-only
-        // chunks cannot extend the budget by re-arming a fresh timer.
+        // off the socket. The deadline was armed before fetch and remains in
+        // force through headers, error-body reads, and framing-only chunks.
         let gotFirstToken = false;
         let firstTokenTimedOut = false;
         let streamError: string | null = null;
-        const attemptStartedAt = Date.now();
-        const firstTokenDeadline = attemptStartedAt + firstTokenTimeoutForModel(model.id);
-        const FIRST_TOKEN_SENTINEL = Symbol("firstTokenTimeout");
+        let consecutiveZeroProgressReads = 0;
         type ReadResult = { done: boolean; value?: Uint8Array };
 
-        while (true) {
-          let readResult: ReadResult;
-          if (!gotFirstToken) {
-            const readPromise = reader.read() as Promise<ReadResult>;
-            let firstTokenTimer: ReturnType<typeof setTimeout> | null = null;
-            const remainingMs = Math.max(0, firstTokenDeadline - Date.now());
-            const result = await Promise.race([
-              readPromise,
-              new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
-                firstTokenTimer = setTimeout(() => resolve(FIRST_TOKEN_SENTINEL), remainingMs);
-              }),
-            ]);
-            // Always clear the timer — otherwise the happy path keeps the
-            // event loop alive for firstTokenTimeout ms after the stream
-            // ends, which is user-visible as a hang before a short-lived
-            // CLI exits.
-            if (firstTokenTimer) clearTimeout(firstTokenTimer);
-            if (result === FIRST_TOKEN_SENTINEL) {
-              readPromise.catch(() => {});
-              void reader.cancel().catch(() => {});
-              firstTokenTimedOut = true;
-              break;
-            }
-            readResult = result as ReadResult;
-          } else {
-            readResult = (await reader.read()) as ReadResult;
-          }
+        const rejectIncompleteToolCall = () => {
+          if (!currentToolCall) return;
+          // A tool-use frame without its terminating stop is not executable.
+          // Never turn an EOF or a new tool frame into a completed call.
+          toolCallError ??= "tool call ended before provider sent stop";
+          currentToolCall = null;
+        };
 
-          const { done, value } = readResult;
-          if (done) break;
-          const decoded = decoder.decode(value, { stream: true });
-          buffer += decoded;
-          if (log.isUnsafeDebugPayloadEnabled()) {
-            log.debug("stream.chunk.payload", {
-              seq: chunkSeq++,
-              bytes: value?.byteLength ?? 0,
-              decodedLen: decoded.length,
-              preview: previewChunk(decoded),
-            });
-          }
-          const { events, remaining } = parseKiroEvents(buffer);
-          buffer = remaining;
-          resetIdle();
-
+        const processEvents = (events: ReturnType<typeof parser.push>) => {
           if (!gotFirstToken && events.length > 0) {
             gotFirstToken = true;
+            finishAttemptDeadline.disarmFirstEventTimer();
             // Cache effectiveness has no wire accounting, so log TTFT to make
             // an opt-in comparison measurable.
             log.info("stream.firstToken", {
-              ms: Date.now() - attemptStartedAt,
+              ms: Date.now() - firstEventStartedAt,
               cachePoints: useCachePoints,
               historyLen: history.length,
             });
@@ -806,8 +950,11 @@ export function streamKiro(
                 // the breadcrumb finalizes above the tool execution.
                 closeHiddenBreadcrumb();
                 sawAnyToolCalls = true;
-                if (!currentToolCall || currentToolCall.toolUseId !== tc.toolUseId) {
-                  flushToolCall();
+                if (currentToolCall && currentToolCall.toolUseId !== tc.toolUseId) {
+                  rejectIncompleteToolCall();
+                  break;
+                }
+                if (!currentToolCall) {
                   currentToolCall = { toolUseId: tc.toolUseId, name: tc.name, input: "" };
                 }
                 currentToolCall.input += tc.input || "";
@@ -830,7 +977,7 @@ export function streamKiro(
               }
               case "error": {
                 streamError = sanitizeKiroStreamEventError(event.data.error, event.data.message);
-                void reader.cancel().catch(() => {});
+                finishAttemptDeadline.cancelReader();
                 break;
               }
               case "followupPrompt": {
@@ -850,10 +997,82 @@ export function streamKiro(
             }
             if (streamError || toolCallError) break;
           }
-          if (toolCallError) break;
+        };
+
+        while (true) {
+          let readResult: ReadResult;
+          try {
+            // Even after the first event disarms its timer, this signal still
+            // relays caller cancellation. Do not rely solely on reader.cancel:
+            // a non-conforming body can leave read() pending forever.
+            readResult = await awaitWithAbort(reader.read() as Promise<ReadResult>, firstEventDeadline!.signal);
+          } catch (error) {
+            if (!gotFirstToken && firstEventDeadline!.timedOut) {
+              firstTokenTimedOut = true;
+              break;
+            }
+            // Keep the ordinary idle retry/failure path, but let a caller
+            // abort win if both signals arrive at the same time.
+            if (idleCancelled && !options?.signal?.aborted) break;
+            throw error;
+          }
+
+          const { done, value } = readResult;
+          if (done) break;
+          const decoded = decoder.decode(value, { stream: true });
+          if (log.isUnsafeDebugPayloadEnabled()) {
+            log.debug("stream.chunk.payload", {
+              seq: chunkSeq++,
+              bytes: value?.byteLength ?? 0,
+              decodedLen: decoded.length,
+              preview: previewChunk(decoded),
+            });
+          }
+          const events = parser.push(decoded);
+          // A non-empty framing chunk is transport progress under the existing
+          // idle contract even when it contains no parsed event. Empty reads
+          // are not progress and cannot re-arm the idle deadline.
+          if ((value?.byteLength ?? 0) > 0 || decoded.length > 0) {
+            consecutiveZeroProgressReads = 0;
+            resetIdle();
+          } else if (++consecutiveZeroProgressReads >= MAX_CONSECUTIVE_ZERO_PROGRESS_READS) {
+            // A non-conforming reader can resolve empty reads forever in the
+            // microtask queue, starving both first-event and idle timers.
+            // Yield without treating it as transport progress so those
+            // existing deadlines decide the attempt deterministically.
+            consecutiveZeroProgressReads = 0;
+            try {
+              await abortableDelay(0, firstEventDeadline!.signal);
+            } catch (error) {
+              if (!gotFirstToken && firstEventDeadline!.timedOut) {
+                firstTokenTimedOut = true;
+                break;
+              }
+              if (idleCancelled && !options?.signal?.aborted) break;
+              throw error;
+            }
+          }
+          processEvents(events);
+          if (streamError || toolCallError) break;
         }
 
+        if (!firstTokenTimedOut && !idleCancelled && !streamError && !toolCallError) {
+          // Flush a final split UTF-8 sequence before deciding whether the
+          // provider ended cleanly, then reject a recognized partial frame.
+          const trailingDecoded = decoder.decode();
+          if (trailingDecoded) processEvents(parser.push(trailingDecoded));
+          if (!toolCallError) parser.finish();
+          if (!toolCallError) rejectIncompleteToolCall();
+        }
+
+        if (toolCallError) {
+          // EOF/new-frame tool protocol failures are terminal for this body;
+          // abort the attempt as well as cancelling its locked reader.
+          firstEventDeadline!.abort(new Error("stream tool protocol error"));
+          finishAttemptDeadline.cancelReader();
+        }
         if (idleTimer) clearTimeout(idleTimer);
+        finishAttemptDeadline.cleanup();
 
         // A malformed tool call is a property of the response, not of the
         // transport, so it is decided before any retry. Retrying would let a
@@ -898,21 +1117,22 @@ export function streamKiro(
           closeHiddenBreadcrumb();
         }
 
-        flushToolCall();
         // Same finalize-and-close-text sequence as the error paths, routed
         // through the shared helper so its idempotence flag is set. Closing it
         // inline here would let a later closeActiveAttempt() emit a second
         // text_end for the same block.
         closeOpenProviderBlocks();
 
-        // The trailing flushToolCall() above can be the first to see a
-        // malformed call, so this is checked again after the pre-retry gate.
-        // Not retried: the caller is told the turn failed rather than
-        // receiving a `stop` that hides a dropped action.
+        // EOF must not promote an unterminated tool-use sequence into a tool
+        // call. rejectIncompleteToolCall() above preserves visible text while
+        // reporting the protocol failure instead of a normal stop.
         if (toolCallError) throw new Error(`Kiro API error: ${toolCallError}`);
 
-        if (usageEvent?.inputTokens !== undefined) output.usage.input = usageEvent.inputTokens;
-        output.usage.output = usageEvent?.outputTokens ?? countTokens(totalContent);
+        // TypeScript cannot see assignments made in processEvents(), so keep
+        // the declared wire shape while reading its finalized value.
+        const reportedUsage = usageEvent as { inputTokens?: number; outputTokens?: number } | null;
+        if (reportedUsage?.inputTokens !== undefined) output.usage.input = reportedUsage.inputTokens;
+        output.usage.output = reportedUsage?.outputTokens ?? countTokens(totalContent);
         output.usage.totalTokens = output.usage.input + output.usage.output;
         try {
           calculateCost(model, output.usage);
