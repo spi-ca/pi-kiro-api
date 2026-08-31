@@ -1,7 +1,7 @@
 # pi-kiro-api
 
-A [Pi](https://pi.dev) native provider for Kiro API keys, built against Pi
-**0.84.1+**, and verified against 0.84.2. It uses provider-owned
+A [Pi](https://pi.dev) native provider for Kiro API keys, built and verified
+against Pi **0.84.4**. It uses provider-owned
 authentication and Kiro's
 `ListAvailableModels` catalog for the active key and AWS region. The streaming
 implementation under `src/kiro/` is vendored from
@@ -47,7 +47,7 @@ credential retains precedence over the environment. Set `PI_OFFLINE=1` (or use
 Pi's `--offline`) to skip that ambient network preload while still registering
 the provider.
 
-As of Pi 0.84.2, `--api-key` alone cannot bootstrap this dynamic provider's
+As of Pi 0.84.4, `--api-key` alone cannot bootstrap this dynamic provider's
 initial `ListAvailableModels` catalog. Use `/login kiro-api-key` (recommended)
 or set `KIRO_API_KEY` before Pi starts. A changed `--api-key` also fails closed
 by clearing a catalog scoped to a different key; an already matching cache may
