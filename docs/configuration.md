@@ -68,9 +68,9 @@ provider. It cannot bootstrap `ListAvailableModels` before the provider is
 registered, so `--api-key` alone does not produce an initial Kiro catalog. Use
 `/login kiro-api-key` (recommended) or set `KIRO_API_KEY` before Pi starts.
 
-This holds for 0.84.1 through 0.84.2. Pi 0.84.2 changed nothing in dynamic
-provider registration or native credential resolution, so the constraint is
-unchanged rather than fixed.
+This holds for 0.84.1 through 0.84.4. Pi 0.84.4 changed nothing in dynamic
+provider registration or native credential resolution that removes this constraint,
+so it remains unchanged rather than fixed.
 
 A runtime `--api-key` may happen to work only when Pi already has a persisted
 catalog matching that exact key and region. It is not a supported bootstrap
