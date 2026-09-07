@@ -383,7 +383,11 @@ export function streamKiro(
       }
 
       const endpoint = model.baseUrl || "https://q.us-east-1.amazonaws.com/";
-      const kiroModelId = toKiroModelId(model.id);
+      // The dynamic provider only reaches this stream with a validated exact
+      // wire ID. Keep the legacy conversion solely for direct standalone
+      // static/compatibility callers of this vendored stream; it must not
+      // revive a missing mapping from a provider catalog or cache.
+      const kiroModelId = (model as KiroModel).wireModelId ?? toKiroModelId(model.id);
       // pi hands a session thinking level here, or undefined when thinking is
       // off. Clamp it against the model's own ladder so a level the model
       // marks unsupported cannot pick a budget the UI never offered.

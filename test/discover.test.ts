@@ -175,6 +175,24 @@ describe("Kiro model discovery", () => {
     expect(deepseek?.name).toBe("DeepSeek 3.2");
   });
 
+  test("rejects wire IDs that collide after legacy dot-to-dash conversion", async () => {
+    await withMockFetch(
+      async () =>
+        new Response(
+          JSON.stringify({
+            models: [
+              { modelId: "arbitrary-1.2", supportedInputTypes: ["TEXT"] },
+              { modelId: "arbitrary-1-2", supportedInputTypes: ["TEXT"] },
+            ],
+          }),
+          { status: 200 },
+        ),
+      async () => {
+        await expect(discoverKiroModels("ksk_test-key", BASE_URL)).rejects.toThrow("colliding model IDs");
+      },
+    );
+  });
+
   test("rejects empty and all-invalid discovery responses", async () => {
     await withMockFetch(
       async () => new Response(JSON.stringify({ models: [] }), { status: 200 }),

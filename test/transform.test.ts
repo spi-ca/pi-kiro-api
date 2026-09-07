@@ -1,6 +1,19 @@
 import { expect, test } from "bun:test";
 import type { Message } from "@earendil-works/pi-ai";
-import { buildHistory, getContentText, ToolUseIdMapper } from "../src/kiro/transform.ts";
+import { buildHistory, getContentText, parseToolArgs, ToolUseIdMapper } from "../src/kiro/transform.ts";
+
+test("parseToolArgs accepts only non-null, non-array objects", () => {
+  const direct = { command: "true", nested: { flags: ["-n"] } };
+  expect(parseToolArgs(direct)).toBe(direct);
+  expect(parseToolArgs(direct)).toEqual({ command: "true", nested: { flags: ["-n"] } });
+  expect(parseToolArgs(["not", "an", "object"])).toEqual({});
+  expect(parseToolArgs(null)).toEqual({});
+  expect(parseToolArgs('{"command":"true"}')).toEqual({ command: "true" });
+  expect(parseToolArgs("[1,2]")).toEqual({});
+  expect(parseToolArgs("null")).toEqual({});
+  expect(parseToolArgs('"text"')).toEqual({});
+  expect(parseToolArgs("invalid JSON")).toEqual({});
+});
 
 test("history conversion drops provider-internal thinking blocks", () => {
   const messages: Message[] = [

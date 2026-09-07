@@ -126,7 +126,7 @@ describe("Kiro native provider authentication", () => {
     expect(publications).toBe(1);
     expect(persisted).toEqual(
       expect.objectContaining({
-        etag: expect.stringMatching(/^kiro-catalog-scope-sha256:[a-f0-9]{64}$/),
+        etag: expect.stringMatching(/^kiro-catalog-v2:[a-f0-9]{64}:[a-f0-9]{64}$/),
         models: provider.getModels(),
       }),
     );
@@ -327,7 +327,7 @@ describe("Kiro native provider authentication", () => {
           }),
         ),
     );
-    expect(persisted?.etag).toMatch(/^kiro-catalog-scope-sha256:[a-f0-9]{64}$/);
+    expect(persisted?.etag).toMatch(/^kiro-catalog-v2:[a-f0-9]{64}:[a-f0-9]{64}$/);
 
     const matching = createKiroProvider();
     await matching.refreshModels?.(
@@ -470,6 +470,236 @@ describe("Kiro native provider authentication", () => {
       refreshContext(credential("scope-key", "eu-central-1"), { allowNetwork: false, stored: unsafe }),
     );
     expect(restored.getModels()).toEqual([]);
+  });
+
+  test("offline restore rejects content mutations, missing wire IDs, and legacy scope-only caches", async () => {
+    const source = createKiroProvider();
+    let persisted: ModelsStoreEntry | undefined;
+    await withMockFetch(
+      async () => new Response(JSON.stringify(MODEL_LIST), { status: 200 }),
+      async () =>
+        source.refreshModels?.(
+          refreshContext(credential("cache-key", "eu-central-1"), {
+            publish: async ({ persist, update }) => {
+              persisted = persist ?? undefined;
+              update?.();
+              return true;
+            },
+          }),
+        ),
+    );
+    if (!persisted) throw new Error("catalog was not persisted");
+
+    const cases: ModelsStoreEntry[] = [
+      {
+        ...persisted,
+        models: persisted.models.map((model) => ({ ...model, name: "mutated catalog model" })),
+      },
+      {
+        ...persisted,
+        models: persisted.models.map((model) => ({ ...model, wireModelId: undefined })),
+      },
+      {
+        ...persisted,
+        etag: "kiro-catalog-scope-sha256:" + "0".repeat(64),
+      },
+    ];
+
+    for (const stored of cases) {
+      const restored = createKiroProvider();
+      let fetchCalls = 0;
+      await withMockFetch(
+        async () => {
+          fetchCalls++;
+          throw new Error("offline cache restore must not fetch");
+        },
+        async () =>
+          restored.refreshModels?.(
+            refreshContext(credential("cache-key", "eu-central-1"), { allowNetwork: false, stored }),
+          ),
+      );
+      expect(fetchCalls).toBe(0);
+      expect(restored.getModels()).toEqual([]);
+    }
+  });
+
+  test("malformed cache entries are ignored offline and replaced by mocked network discovery", async () => {
+    const source = createKiroProvider();
+    let persisted: ModelsStoreEntry | undefined;
+    await withMockFetch(
+      async () => new Response(JSON.stringify(MODEL_LIST), { status: 200 }),
+      async () =>
+        source.refreshModels?.(
+          refreshContext(credential("malformed-cache-key", "eu-central-1"), {
+            publish: async ({ persist, update }) => {
+              persisted = persist ?? undefined;
+              update?.();
+              return true;
+            },
+          }),
+        ),
+    );
+    if (!persisted) throw new Error("catalog was not persisted");
+
+    const accessorModel = { ...persisted.models[0]! };
+    let accessorReads = 0;
+    Object.defineProperty(accessorModel, "name", {
+      enumerable: true,
+      get: () => {
+        accessorReads++;
+        throw new Error("cache accessor must not run");
+      },
+    });
+    const malformedEntries: unknown[] = [
+      null,
+      1,
+      { ...persisted.models[0]!, name: 1 },
+      accessorModel,
+    ];
+
+    for (const entry of malformedEntries) {
+      const restored = createKiroProvider();
+      let fetchCalls = 0;
+      await withMockFetch(
+        async () => {
+          fetchCalls++;
+          return new Response(JSON.stringify(MODEL_LIST), { status: 200 });
+        },
+        async () => {
+          const stored = { ...persisted, models: [entry] } as unknown as ModelsStoreEntry;
+          await restored.refreshModels?.(
+            refreshContext(credential("malformed-cache-key", "eu-central-1"), {
+              allowNetwork: false,
+              stored,
+            }),
+          );
+          expect(fetchCalls).toBe(0);
+          expect(restored.getModels()).toEqual([]);
+
+          await restored.refreshModels?.(
+            refreshContext(credential("malformed-cache-key", "eu-central-1")),
+          );
+        },
+      );
+      expect(fetchCalls).toBe(1);
+      expect(restored.getModels()).toHaveLength(2);
+    }
+    expect(accessorReads).toBe(0);
+  });
+
+  test("dispatches a discovered exact wire model ID from mocked discovery through streaming", async () => {
+    const wireModelId = "arbitrary-1.2";
+    const provider = createKiroProvider();
+    const requests: Array<{ target: string | null; body: Record<string, unknown> }> = [];
+
+    await withMockFetch(
+      async (_input, init) => {
+        const headers = new Headers(init?.headers);
+        requests.push({ target: headers.get("X-Amz-Target"), body: JSON.parse(String(init?.body ?? "{}")) });
+        if (requests.length === 1) {
+          return new Response(
+            JSON.stringify({ models: [{ modelId: wireModelId, supportedInputTypes: ["TEXT"] }] }),
+            { status: 200 },
+          );
+        }
+        return new Response("denied", { status: 400 });
+      },
+      async () => {
+        await provider.refreshModels?.(refreshContext(credential("wire-key", "eu-central-1")));
+        const model = provider.getModels()[0]!;
+        await provider.streamSimple(
+          model,
+          { messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [] },
+          { apiKey: "wire-key", env: { KIRO_API_REGION: "eu-central-1" } },
+        ).result();
+      },
+    );
+
+    expect(requests).toHaveLength(2);
+    expect(requests[0]!.target).toBe("AmazonCodeWhispererService.ListAvailableModels");
+    expect(requests[1]!.target).toBe("AmazonCodeWhispererStreamingService.GenerateAssistantResponse");
+    expect(requests[1]!.body).toMatchObject({
+      conversationState: { currentMessage: { userInputMessage: { modelId: wireModelId } } },
+    });
+  });
+
+  test("rejects a cached catalog with colliding public model IDs", async () => {
+    const source = createKiroProvider();
+    let persisted: ModelsStoreEntry | undefined;
+    await withMockFetch(
+      async () => new Response(JSON.stringify(MODEL_LIST), { status: 200 }),
+      async () =>
+        source.refreshModels?.(
+          refreshContext(credential("collision-key", "eu-central-1"), {
+            publish: async ({ persist, update }) => {
+              persisted = persist ?? undefined;
+              update?.();
+              return true;
+            },
+          }),
+        ),
+    );
+    if (!persisted) throw new Error("catalog was not persisted");
+
+    const [first] = persisted.models;
+    const colliding: ModelsStoreEntry = {
+      ...persisted,
+      models: [first!, { ...first!, name: "colliding cache entry" }],
+    };
+    const restored = createKiroProvider();
+    await restored.refreshModels?.(
+      refreshContext(credential("collision-key", "eu-central-1"), { allowNetwork: false, stored: colliding }),
+    );
+
+    expect(restored.getModels()).toEqual([]);
+  });
+
+  test("offline cache restore retains the exact discovered wire model ID", async () => {
+    const wireModelId = "arbitrary-1.2";
+    const publicModelId = "arbitrary-1-2";
+    const source = createKiroProvider();
+    let persisted: ModelsStoreEntry | undefined;
+    await withMockFetch(
+      async () =>
+        new Response(
+          JSON.stringify({ models: [{ modelId: wireModelId, supportedInputTypes: ["TEXT"] }] }),
+          { status: 200 },
+        ),
+      async () =>
+        source.refreshModels?.(
+          refreshContext(credential("wire-key", "eu-central-1"), {
+            publish: async ({ persist, update }) => {
+              persisted = persist ?? undefined;
+              update?.();
+              return true;
+            },
+          }),
+        ),
+    );
+    expect(source.getModels()[0]).toMatchObject({ id: publicModelId, wireModelId });
+
+    const restored = createKiroProvider();
+    await restored.refreshModels?.(
+      refreshContext(credential("wire-key", "eu-central-1"), { allowNetwork: false, stored: persisted }),
+    );
+    const model = restored.getModels()[0]!;
+    expect(model).toMatchObject({ id: publicModelId, wireModelId });
+
+    let requestBody = "";
+    await withMockFetch(
+      async (_input, init) => {
+        requestBody = String(init?.body ?? "");
+        return new Response("denied", { status: 400 });
+      },
+      async () => {
+        await restored.streamSimple(
+          model,
+          { messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [] },
+          { apiKey: "wire-key", env: { KIRO_API_REGION: "eu-central-1" } },
+        ).result();
+      },
+    );
+    expect(requestBody).toContain(`"modelId":"${wireModelId}"`);
   });
 
   test("ambient preload discovers and atomically installs its catalog", async () => {

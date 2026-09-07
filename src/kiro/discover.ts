@@ -13,7 +13,7 @@
 import { log } from "./debug.ts";
 import { readResponseTextBounded, sanitizeKiroError } from "./errors.ts";
 import { KIRO_ORIGIN } from "./transform.ts";
-import { kiroModels, type KiroModel, withThinkingLevels } from "./models.ts";
+import { kiroModels, type KiroModel, toKiroModelId, toPiModelId, withThinkingLevels } from "./models.ts";
 
 /**
  * Note the service prefix: the list operation lives on
@@ -76,11 +76,6 @@ const BEHAVIOR_BY_KIRO_ID: Record<string, Partial<KiroModel>> = Object.fromEntri
 const ONE_M_SUFFIX = "-1m";
 const ONE_M_CONTEXT = 1_000_000;
 
-/** Convert a Kiro dot-form ID to pi's dash form (4.6 → 4-6). */
-function toPiId(kiroId: string): string {
-  return kiroId.replace(/(\d)\.(\d)/g, "$1-$2");
-}
-
 /**
  * Append the credit rate multiplier to a model's display name, e.g.
  * "Claude Sonnet 4.6 (2x credits)". Kiro bills in credits via
@@ -94,7 +89,7 @@ function withRateMultiplier(name: string, rateMultiplier?: number): string {
 }
 
 function toKiroModel(api: ApiModel, baseUrl: string): KiroModel {
-  const piId = toPiId(api.modelId);
+  const piId = toPiModelId(api.modelId);
   const types = api.supportedInputTypes ?? ["TEXT"];
   const input: ("text" | "image")[] = types.some((t) => t.toUpperCase() === "IMAGE")
     ? ["text", "image"]
@@ -105,6 +100,7 @@ function toKiroModel(api: ApiModel, baseUrl: string): KiroModel {
   // than one chosen before that flag is known.
   return withThinkingLevels({
     id: piId,
+    wireModelId: api.modelId,
     name: withRateMultiplier(api.modelName ?? piId, api.rateMultiplier),
     api: "kiro-api",
     provider: "kiro",
@@ -143,6 +139,7 @@ function deriveLongContextVariants(discovered: KiroModel[], baseUrl: string): Ki
       withThinkingLevels({
         ...base,
         id: staticModel.id,
+        wireModelId: `${base.wireModelId ?? toKiroModelId(baseId)}${ONE_M_SUFFIX}`,
         name: `${base.name} (1M)`,
         contextWindow: ONE_M_CONTEXT,
         ...BEHAVIOR_BY_KIRO_ID[staticModel.id.replace(/(\d)-(\d)/g, "$1.$2")],
@@ -230,6 +227,18 @@ export async function discoverKiroModels(
   }
 
   const models = [...discovered, ...deriveLongContextVariants(discovered, baseUrl)];
+  const publicIds = new Set<string>();
+  const wireIds = new Set<string>();
+  for (const model of models) {
+    // A dashed public ID may represent more than one arbitrary wire ID (for
+    // example, `model-1.2` and `model-1-2`). Refuse an ambiguous catalog
+    // rather than allowing one entitlement to overwrite another.
+    if (publicIds.has(model.id) || !model.wireModelId || wireIds.has(model.wireModelId)) {
+      throw new Error("Kiro model discovery returned colliding model IDs.");
+    }
+    publicIds.add(model.id);
+    wireIds.add(model.wireModelId);
+  }
 
   log.info("discover.ok", {
     count: models.length,
