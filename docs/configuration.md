@@ -1,7 +1,9 @@
 # Configuration and authentication
 
-Install this fork with `pi install git:github.com/spi-ca/pi-kiro-api`, then
-restart Pi or reload packages as appropriate for the active session.
+Install this fork with
+`pi install git:github.com/spi-ca/pi-kiro-api@v20260907-1`, then restart Pi
+or reload packages as appropriate for the active session. npm installation is
+not supported.
 
 ## Interactive login
 
