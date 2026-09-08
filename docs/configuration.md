@@ -1,7 +1,9 @@
 # Configuration and authentication
 
-Install this fork with `pi install git:github.com/spi-ca/pi-kiro-api`, then
-restart Pi or reload packages as appropriate for the active session.
+Install this fork with
+`pi install git:github.com/spi-ca/pi-kiro-api@v20260907-1`, then restart Pi
+or reload packages as appropriate for the active session. npm installation is
+not supported.
 
 ## Interactive login
 
@@ -86,16 +88,27 @@ login installs its result immediately; Pi's following matching cache-only
 refresh persists that already validated catalog for offline restart. Ambient
 preload failure is non-fatal; final native credential resolution and cache
 restoration retain stored credential precedence. The live catalog, its
-model-ID dispatch map, and its request allowlist are bound atomically to a
-non-secret SHA-256 digest of the effective key and region.
+model-ID dispatch map, and its request allowlist are bound atomically to the
+effective key and region.
 
-Pi may restore a persisted catalog during offline/cache-only refresh **only**
-when that digest matches the exact effective key and region and every cached
-model has the expected HTTPS regional Kiro endpoint. Once that stored catalog
-also matches the live catalog, later offline refreshes reuse it without another
+Persisted catalogs use a v2 cache tag: a non-secret SHA-256 key/region scope
+plus an HMAC-SHA-256 over the canonical catalog contents using the API key
+without storing that key. Pi may restore one during offline/cache-only refresh
+**only** when that tag validates for the exact effective key and region, every
+cached model has the expected HTTPS regional Kiro endpoint, and every model has
+an exact `wireModelId` matching its public Pi ID. This protects the canonical
+public-ID-to-wire-ID allowlist from a modified user-writable cache; scope alone
+is not treated as proof of catalog contents. Once that stored catalog also
+matches the live catalog, later offline refreshes reuse it without another
 persistence publication. A live catalog for a different credential scope is
 cleared through Pi's accepted publication before cache restoration; it never
 crosses a key or region change.
+
+Older scope-only (v1) entries and any cache entry without an exact wire ID are
+invalidated rather than reconstructed with the legacy dash-to-dot conversion.
+A cache-only/offline refresh ignores them without making a network request and
+leaves the provider empty; the next allowed network refresh fetches and writes
+a v2 catalog.
 
 For a normal network refresh in the **same** scope, the previous live catalog
 and persisted cache remain available if discovery has a transient failure. No
@@ -124,6 +137,15 @@ The currently derivable companions are `claude-opus-4-6-1m`,
 suffix is not synthesized for arbitrary discovered models, and no other static
 IDs are added — the entitlement boundary from `ListAvailableModels` is
 otherwise preserved exactly.
+
+Each discovered dashed Pi ID is stored with its exact `ListAvailableModels`
+wire ID in the credential-scoped catalog and its offline cache. Requests use
+that mapping rather than reconstructing arbitrary IDs with the legacy
+number-dot/number-dash conversion. If two wire IDs would expose the same Pi
+ID, discovery rejects the ambiguous catalog. Dynamic provider catalogs never
+use the legacy fallback: missing mappings invalidate the entry. The fallback
+remains only in the standalone vendored stream path for its hand-maintained
+static/compatibility models, where no dynamic entitlement catalog is claimed.
 
 ## Thinking levels
 

@@ -166,10 +166,12 @@ export function getContentText(msg: Message): string {
  * that aren't valid JSON. Fall back to {} rather than crashing the stream.
  */
 export function parseToolArgs(input: unknown): Record<string, unknown> {
-  if (input && typeof input === "object") return input as Record<string, unknown>;
-  if (typeof input !== "string") return {};
+  const asRecord = (value: unknown): Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+
+  if (typeof input !== "string") return asRecord(input);
   try {
-    return JSON.parse(input) as Record<string, unknown>;
+    return asRecord(JSON.parse(input));
   } catch {
     return {};
   }

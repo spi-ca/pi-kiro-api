@@ -56,3 +56,14 @@ authoritative refresh behavior, generation-rejected publications, event-stream
 parsing with split frames and bounded buffering, tool-call failure handling, and
 sanitized error/log-file safety. Live Kiro acceptance is intentionally outside
 CI and this repository's routine verification scope.
+
+## Automatic CI compatibility matrix
+
+Push and pull-request CI runs `bun run ci`, `bun pm pack --dry-run`, and a provider-free tarball smoke; it passes no provider credentials and does not invoke Kiro/network acceptance. The smoke installs the tarball with lifecycle scripts disabled in an isolated temporary consumer, adds exact Pi runtime peers, imports it, and invokes only a registration stub with `KIRO_API_KEY` removed and `PI_OFFLINE=1`. Each lane logs the selected Bun version and the available `cc` compiler.
+
+| Lane | Bun | Pi development graph | Install |
+| --- | --- | --- | --- |
+| locked baseline | 1.3.14 (`packageManager`) | `pi-ai` and `pi-coding-agent` exact 0.84.4 lockfile graph | `bun install --frozen-lockfile` |
+| current compatibility | 1.4.2 | both declared Pi devDependencies selected exactly at 0.85.1 in an ephemeral graph | `bun install --no-save` |
+
+Each lane's repository-install graph verifier recursively checks hoisted links and Bun `.bun` nested symlinks against the selected exact Pi stack mapping: `0.84.4` for the locked baseline and `0.85.1` for compatibility. Every package in that selected mapping must be installed at its exact version. Separately, the tarball smoke deliberately injects the complete selected exact Pi graph and declared non-Pi peers into its isolated consumer as a deterministic compatibility harness against wildcard or transitive drift; it is not a minimal-peer-install proof. The compatibility lane does not let optional `*` peers select a latest package: it temporarily selects every declared Pi development package at exact `0.85.1`, restores the manifest, and checks that neither it nor the lockfile changed. This describes hosted-CI configuration, not a locally performed reinstall or live-provider result.

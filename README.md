@@ -12,13 +12,13 @@ implementation under `src/kiro/` is vendored from
 The supported distributable path is this Git fork:
 
 ```bash
-pi install git:github.com/spi-ca/pi-kiro-api
-# or, for development
+pi install git:github.com/spi-ca/pi-kiro-api@v20260907-1
+# or, for local development
 pi install /path/to/pi-kiro-api
 ```
 
-Add `-l` to install into the current project's Pi settings. This fork is not
-advertised as an npm installation.
+Add `-l` to install into the current project's Pi settings. npm installation
+is not supported.
 
 ## Quick start
 

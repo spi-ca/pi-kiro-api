@@ -16,6 +16,11 @@ export function toKiroModelId(modelId: string): string {
   return modelId.replace(/(\d)-(\d)/g, "$1.$2");
 }
 
+/** Convert Kiro's historical dot-form IDs to Pi's public dash form. */
+export function toPiModelId(wireModelId: string): string {
+  return wireModelId.replace(/(\d)\.(\d)/g, "$1-$2");
+}
+
 /** Default Kiro API-key endpoint (service root, not the OAuth path). */
 const BASE_URL = "https://q.us-east-1.amazonaws.com/";
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
@@ -33,6 +38,11 @@ const MULTIMODAL: Input = ["text", "image"];
 const TEXT_ONLY: Input = ["text"];
 
 export type KiroModel = Model<"kiro-api"> & {
+  /**
+   * Exact Kiro wire ID returned by discovery. It is catalog-scoped and avoids
+   * reconstructing arbitrary IDs from Pi's public dashed form.
+   */
+  wireModelId?: string;
   /** Optional per-model override for the first-token timeout (ms). */
   firstTokenTimeout?: number;
   /**
