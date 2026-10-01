@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ApiKeyCredential, ModelsStoreEntry, RefreshModelsContext } from "@earendil-works/pi-ai";
-import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, normalizeContext } from "@earendil-works/pi-ai";
+import type { KiroHistoryEntry, KiroUserInputMessage } from "../src/kiro/transform.ts";
 import {
   DEFAULT_KIRO_REGION,
   KIRO_PROVIDER_ID,
@@ -607,11 +608,7 @@ describe("Kiro native provider authentication", () => {
       async () => {
         await provider.refreshModels?.(refreshContext(credential("wire-key", "eu-central-1")));
         const model = provider.getModels()[0]!;
-        await provider.streamSimple(
-          model,
-          { messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [] },
-          { apiKey: "wire-key", env: { KIRO_API_REGION: "eu-central-1" } },
-        ).result();
+        await provider.streamSimple(model, normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [] }), { apiKey: "wire-key", env: { KIRO_API_REGION: "eu-central-1" } },).result();
       },
     );
 
@@ -692,11 +689,7 @@ describe("Kiro native provider authentication", () => {
         return new Response("denied", { status: 400 });
       },
       async () => {
-        await restored.streamSimple(
-          model,
-          { messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [] },
-          { apiKey: "wire-key", env: { KIRO_API_REGION: "eu-central-1" } },
-        ).result();
+        await restored.streamSimple(model, normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [] }), { apiKey: "wire-key", env: { KIRO_API_REGION: "eu-central-1" } },).result();
       },
     );
     expect(requestBody).toContain(`"modelId":"${wireModelId}"`);
@@ -774,21 +767,9 @@ describe("Kiro native provider authentication", () => {
         await provider.refreshModels?.(refreshContext(credential("validated-key", "eu-central-1")));
         const model = provider.getModels()[0]!;
 
-        const keyMismatch = await provider.stream(
-          model,
-          { messages: [], tools: [] },
-          { apiKey: "other-key", env: { KIRO_API_REGION: "eu-central-1" } },
-        ).result();
-        const regionMismatch = await provider.streamSimple(
-          model,
-          { messages: [], tools: [] },
-          { apiKey: "validated-key", env: { KIRO_API_REGION: "us-west-2" } },
-        ).result();
-        const matching = await provider.streamSimple(
-          model,
-          { messages: [], tools: [] },
-          { apiKey: "validated-key", env: { KIRO_API_REGION: "eu-central-1" } },
-        ).result();
+        const keyMismatch = await provider.stream(model, normalizeContext({ messages: [], tools: [] }), { apiKey: "other-key", env: { KIRO_API_REGION: "eu-central-1" } },).result();
+        const regionMismatch = await provider.streamSimple(model, normalizeContext({ messages: [], tools: [] }), { apiKey: "validated-key", env: { KIRO_API_REGION: "us-west-2" } },).result();
+        const matching = await provider.streamSimple(model, normalizeContext({ messages: [], tools: [] }), { apiKey: "validated-key", env: { KIRO_API_REGION: "eu-central-1" } },).result();
 
         for (const result of [keyMismatch, regionMismatch]) {
           expect(result.stopReason).toBe("error");
@@ -842,11 +823,7 @@ describe("Kiro native provider authentication", () => {
         return new Response(String.raw`{"content":"ok"}`, { status: 200 });
       },
       async () =>
-        provider.streamSimple(
-          overridden,
-          { messages: [{ role: "user", content: "hi", timestamp: Date.now() }], tools: [] },
-          { apiKey: "stored-key", env: { KIRO_API_REGION: "eu-central-1" }, reasoning: "xhigh" },
-        ).result(),
+        provider.streamSimple(overridden, normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: Date.now() }], tools: [] }), { apiKey: "stored-key", env: { KIRO_API_REGION: "eu-central-1" }, reasoning: "xhigh" },).result(),
     );
 
     // The override budget applies, while the endpoint stays canonical.
@@ -872,11 +849,7 @@ describe("Kiro native provider authentication", () => {
         return new Response("denied", { status: 400 });
       },
       async () => {
-        const result = await provider.streamSimple(
-          crafted,
-          { messages: [], tools: [] },
-          { apiKey: "stream-key" },
-        ).result();
+        const result = await provider.streamSimple(crafted, normalizeContext({ messages: [], tools: [] }), { apiKey: "stream-key" },).result();
         expect(result.stopReason).toBe("error");
       },
     );
@@ -891,8 +864,8 @@ describe("Kiro native provider authentication", () => {
     const unauthorized = { ...provider.getModels()[0]!, id: "not-published" };
 
     for (const stream of [
-      provider.stream(unauthorized, { messages: [], tools: [] }, { apiKey: "stored-key" }),
-      provider.streamSimple(unauthorized, { messages: [], tools: [] }, { apiKey: "stored-key" }),
+      provider.stream(unauthorized, normalizeContext({ messages: [], tools: [] }), { apiKey: "stored-key" }),
+      provider.streamSimple(unauthorized, normalizeContext({ messages: [], tools: [] }), { apiKey: "stored-key" }),
     ]) {
       const events = [];
       for await (const event of stream) events.push(event);
@@ -908,4 +881,102 @@ describe("Kiro native provider authentication", () => {
       ]);
     }
   });
+});
+
+type CapturedKiroRequest = {
+  conversationState: {
+    history?: KiroHistoryEntry[];
+    currentMessage: { userInputMessage: KiroUserInputMessage };
+  };
+};
+
+function freezeTranscript(value: unknown): void {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return;
+  for (const child of Object.values(value)) freezeTranscript(child);
+  Object.freeze(value);
+}
+
+test("native streams replay normalized prompt sections and tool deltas without changing the transcript", async () => {
+  const provider = createKiroProvider();
+  await withMockFetch(
+    async () => new Response(JSON.stringify(MODEL_LIST)),
+    async () => provider.refreshModels?.(refreshContext()),
+  );
+  const model = provider.getModels()[0]!;
+  const oldTool = { name: "read", description: "old read", parameters: { type: "object" } };
+  const updatedTool = { ...oldTool, description: "new read" };
+  const removedTool = { ...oldTool, name: "removed" };
+  const addedTool = { ...oldTool, name: "added" };
+  const context = normalizeContext({
+    messages: [
+      { role: "system", content: "base", sections: { keep: "old section", drop: "gone" }, toolsAdded: [oldTool, removedTool], timestamp: 0 },
+      { role: "user", content: "first question", timestamp: 1 },
+      { role: "assistant", content: [{ type: "toolCall", id: "call/1", name: "removed", arguments: { paths: ["a", "b"], nested: { flag: true } } }], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: 2 },
+      // Deliberately between the assistant and result: must not be a turn anchor.
+      { role: "system", content: [{ type: "text", text: "later instructions" }], sections: { keep: "new section", drop: null, add: "added section" }, toolsRemoved: [{ name: "removed" }, { name: "read" }], toolsAdded: [updatedTool, addedTool], timestamp: 3 },
+      { role: "toolResult", toolCallId: "call/1", toolName: "removed", content: [{ type: "text", text: "result body" }], isError: false, timestamp: 4 },
+      // A trailing system entry must not swallow the current tool-result turn.
+      { role: "system", content: "last instructions", timestamp: 5 },
+    ],
+  });
+  const snapshot = structuredClone(context);
+  freezeTranscript(context);
+  for (const mode of ["stream", "streamSimple"] as const) {
+    let payload!: CapturedKiroRequest;
+    const result = await withMockFetch(
+      async (_url, init) => {
+        payload = JSON.parse(String(init?.body));
+        return new Response('{"content":"ok"}{"contextUsagePercentage":1}');
+      },
+      () => provider[mode](model, context, { apiKey: "stored-key", env: { KIRO_API_REGION: "eu-central-1" } }).result(),
+    );
+    expect(result.stopReason).toBe("stop");
+    const conversation = payload.conversationState;
+    const history = conversation.history!;
+    expect(history).toHaveLength(2);
+    const prompt = history[0]!.userInputMessage!.content;
+    for (const text of ["base", "later instructions", "last instructions", "new section", "added section", "first question"]) expect(prompt).toContain(text);
+    expect(prompt).not.toContain("old section");
+    expect(prompt).not.toContain("gone");
+    const uses = history[1]!.assistantResponseMessage!.toolUses;
+    expect(uses).toEqual([{ name: "removed", toolUseId: "call_1", input: { paths: ["a", "b"], nested: { flag: true } } }]);
+    const current = conversation.currentMessage.userInputMessage;
+    expect(current.content).toBe("Tool results provided.");
+    expect(current.userInputMessageContext!.toolResults).toEqual([{ content: [{ text: "result body" }], status: "success", toolUseId: "call_1" }]);
+    expect(current.userInputMessageContext!.tools!.map((tool) => tool.toolSpecification)).toEqual([
+      { name: "read", description: "new read", inputSchema: { json: { type: "object" } } },
+      { name: "added", description: "old read", inputSchema: { json: { type: "object" } } },
+    ]);
+    expect(context).toEqual(snapshot);
+  }
+});
+
+test("native stream puts a normalized shorthand prompt on the current user and honors removal of all tools", async () => {
+  const provider = createKiroProvider();
+  await withMockFetch(
+    async () => new Response(JSON.stringify(MODEL_LIST)),
+    async () => provider.refreshModels?.(refreshContext()),
+  );
+  const context = normalizeContext({
+    systemPrompt: "shorthand prompt",
+    tools: [{ name: "read", description: "read", parameters: { type: "object" } }],
+    messages: [
+      { role: "user", content: "current question", timestamp: 1 },
+      { role: "system", content: "", toolsRemoved: [{ name: "read" }], timestamp: 2 },
+    ],
+  });
+  const snapshot = structuredClone(context);
+  freezeTranscript(context);
+  let payload!: CapturedKiroRequest;
+  await withMockFetch(
+    async (_url, init) => {
+      payload = JSON.parse(String(init?.body));
+      return new Response('{"content":"ok"}{"contextUsagePercentage":1}');
+    },
+    () => provider.streamSimple(provider.getModels()[0]!, context, { apiKey: "stored-key" }).result(),
+  );
+  expect(payload.conversationState.history).toBeUndefined();
+  expect(payload.conversationState.currentMessage.userInputMessage.content).toContain("shorthand prompt\n\ncurrent question");
+  expect(payload.conversationState.currentMessage.userInputMessage.userInputMessageContext).toBeUndefined();
+  expect(context).toEqual(snapshot);
 });

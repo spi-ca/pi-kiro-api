@@ -22,8 +22,8 @@ bun pm pack --dry-run
 
 `bun pm pack --dry-run` verifies the publish file list without creating or
 publishing a release. Its output should include `extension.ts`, `src/`,
-`README.md`, `docs/`, `LICENSE`, and `NOTICE`. The latter two are required for
-the package's license and vendored-code attribution.
+`README.md`, `CHANGELOG.md`, `docs/`, `LICENSE`, and `NOTICE`. The latter two
+are required for the package's license and vendored-code attribution.
 
 ## Structure
 
@@ -54,8 +54,14 @@ entrypoint registration contract, credential precedence and edge cases, regional
 request headers, discovery response/model mapping, cache-only versus
 authoritative refresh behavior, generation-rejected publications, event-stream
 parsing with split frames and bounded buffering, tool-call failure handling, and
-sanitized error/log-file safety. Live Kiro acceptance is intentionally outside
-CI and this repository's routine verification scope.
+sanitized error/log-file safety. Transcript regressions use actual
+`normalizeContext` output with initial/later sections and tool deltas, verify
+tool replay and current-turn boundaries, and freeze the incoming context.
+Instrumentation tests cover replacement (including falsy values), metadata
+before body reads, ordered parsed events before normalization, callback
+rejection, late completion/rejection, caller abort, bounded hanging hooks, and
+payload mutation isolation from caller-owned schemas/arguments. Live Kiro
+acceptance is intentionally outside CI and routine verification scope.
 
 ## Automatic CI compatibility matrix
 
@@ -63,7 +69,44 @@ Push and pull-request CI runs `bun run ci`, `bun pm pack --dry-run`, and a provi
 
 | Lane | Bun | Pi development graph | Install |
 | --- | --- | --- | --- |
-| locked baseline | 1.3.14 (`packageManager`) | `pi-ai` and `pi-coding-agent` exact 0.84.4 lockfile graph | `bun install --frozen-lockfile` |
-| current compatibility | 1.4.2 | both declared Pi devDependencies selected exactly at 0.85.1 in an ephemeral graph | `bun install --no-save` |
+| locked baseline | 1.3.14 (`packageManager`) | `pi-ai` and `pi-coding-agent` exact 0.99.2 lockfile graph | `bun install --frozen-lockfile` |
+| older transcript compatibility | 1.4.2 | complete exact 0.87.1 runtime graph in an ephemeral install | `bun install --no-save` |
 
-Each lane's repository-install graph verifier recursively checks hoisted links and Bun `.bun` nested symlinks against the selected exact Pi stack mapping: `0.84.4` for the locked baseline and `0.85.1` for compatibility. Every package in that selected mapping must be installed at its exact version. Separately, the tarball smoke deliberately injects the complete selected exact Pi graph and declared non-Pi peers into its isolated consumer as a deterministic compatibility harness against wildcard or transitive drift; it is not a minimal-peer-install proof. The compatibility lane does not let optional `*` peers select a latest package: it temporarily selects every declared Pi development package at exact `0.85.1`, restores the manifest, and checks that neither it nor the lockfile changed. This describes hosted-CI configuration, not a locally performed reinstall or live-provider result.
+The 0.99.2 expected runtime map contains `chord`, `pi-agent-core`, `pi-ai`,
+`pi-codemode`, `pi-coding-agent`, `pi-mcp`, `pi-telemetry`, and `pi-tui`, all
+under `@earendil-works`. The 0.87.1 map has the same packages except codemode
+and MCP, which are not runtime dependencies in that version. Neither lane has
+obsolete `pi-client`/`pi-protocol` runtime dependencies. The recursive verifier
+checks scoped packages, nested `node_modules`, and cyclic Bun store symlinks;
+its self-test also rejects missing, unexpected, and mismatched `chord`.
+
+Every expected package must be present at exactly the selected version.
+The compatibility lane temporarily pins the entire runtime map, then restores
+the manifest and verifies that neither it nor the lockfile changed. The
+tarball smoke injects that same complete map and declared non-Pi peers in an
+isolated consumer: it is a deterministic compatibility harness, not a
+minimal-peer-install proof.
+
+0.85.1 is no longer supported because it lacks `getCurrentSystemPrompt` and
+`getCurrentTools`. 0.87.1 supplies the transcript helpers but predates the
+host's `onProviderStreamEvent` callback. A private stream-options type mirrors
+that optional 0.99.2 contract; there is no runtime version detection, fallback
+implementation, or compatibility shim. Wildcard host peers follow Pi package
+conventions, not an unrestricted support promise.
+
+To run the helpers locally, set `PI_GRAPH_EXPECTED` to the selected lane's JSON
+map in `.github/workflows/ci.yml`:
+
+```bash
+bun .github/scripts/verify-pi-graph.ts
+bun .github/scripts/verify-pi-graph.ts --self-test
+bun .github/scripts/package-smoke.ts --self-test
+PI_OFFLINE=1 bun .github/scripts/package-smoke.ts --existing
+PI_OFFLINE=1 bun .github/scripts/package-smoke.ts
+```
+
+The smoke helper isolates HOME/cache/environment and omits credentials.
+Package-registry access is needed to install the smoke consumer; no Kiro
+service call is made. Local migration verification used Bun 1.4.2, not the
+hosted baseline's Bun 1.3.14. Hosted CI itself and live Kiro acceptance were
+not run locally.

@@ -21,11 +21,19 @@ import type {
   Model,
   SimpleStreamOptions,
   TextContent,
+  TranscriptContext,
   ThinkingContent,
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
-import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import {
+  calculateCost,
+  collapseSystemMessages,
+  createAssistantMessageEventStream,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  normalizeContext,
+} from "@earendil-works/pi-ai";
 import { log, previewChunk } from "./debug.ts";
 import {
   readResponseTextBounded,
@@ -75,8 +83,8 @@ const CAPACITY_MAX_RETRIES = 3;
  * but its response stream reports no cache-hit accounting, so the only
  * available signal is a time-to-first-token comparison.
  */
-function cachePointsEnabled(): boolean {
-  const raw = globalThis.process?.env?.KIRO_CACHE_POINTS;
+function cachePointsEnabled(env?: SimpleStreamOptions["env"]): boolean {
+  const raw = env?.KIRO_CACHE_POINTS ?? globalThis.process?.env?.KIRO_CACHE_POINTS;
   return raw === "1" || raw?.toLowerCase() === "true";
 }
 const CAPACITY_BASE_DELAY_MS = 5_000;
@@ -158,7 +166,12 @@ function createFirstEventDeadline(timeoutMs: number, externalSignal?: AbortSigna
 }
 
 function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return Promise.reject(signal.reason);
+  if (signal.aborted) {
+    // The operation may already have been created by a synchronous callback
+    // that aborted its caller. Observe late rejection even on this fast path.
+    void operation.catch(() => {});
+    return Promise.reject(signal.reason);
+  }
 
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => {
@@ -295,7 +308,7 @@ function emitToolCall(
 ): string | null {
   if (!state.input.trim()) state.input = "{}";
 
-  let args: Record<string, unknown>;
+  let args: ToolCall["arguments"];
   try {
     const parsed = JSON.parse(state.input) as unknown;
     // Valid JSON is not enough: pi's ToolCall.arguments is a record, and
@@ -304,7 +317,7 @@ function emitToolCall(
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("tool arguments must be a JSON object");
     }
-    args = parsed as Record<string, unknown>;
+    args = parsed as ToolCall["arguments"];
   } catch (e) {
     // The parse exception text can quote the offending input, so it stays
     // behind the unsafe-payload gate like every other raw payload.
@@ -333,12 +346,19 @@ function emitToolCall(
   return null;
 }
 
+// Pi 0.87.1 has the transcript contract but predates the host's parsed-event
+// observer. This local type mirrors 0.99.2; it requires no runtime shim and
+// older hosts simply do not supply that optional callback.
+interface KiroStreamOptions extends SimpleStreamOptions {
+  onProviderStreamEvent?: (event: unknown, model: Model<Api>) => void | Promise<void>;
+}
+
 // ---- Main entry --------------------------------------------------------
 
 export function streamKiro(
   model: Model<Api>,
-  context: Context,
-  options?: SimpleStreamOptions,
+  rawContext: Context | TranscriptContext,
+  options?: KiroStreamOptions,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
   (async () => {
@@ -356,7 +376,7 @@ export function streamKiro(
         totalTokens: 0,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },
-      stopReason: "stop",
+      stopReason: "pending",
       timestamp: Date.now(),
     };
 
@@ -370,9 +390,8 @@ export function streamKiro(
     // close that attempt's live blocks before the terminal error event.
     let closeActiveAttempt: (() => void) | undefined;
 
-    // The Pi stream protocol has one lifecycle start for the whole logical
-    // request, not one for each transport retry.
-    stream.push({ type: "start", partial: output });
+    // One lifecycle start after request setup, not one per transport retry.
+    let started = false;
 
     try {
       const apiKey = options?.apiKey;
@@ -382,6 +401,14 @@ export function streamKiro(
         );
       }
 
+      // Keep the exported standalone stream's shorthand Context support. Native
+      // providers already supply a transcript; normalization preserves it.
+      const context = collapseSystemMessages(normalizeContext(rawContext));
+      const tools = getCurrentTools(context.messages);
+      const currentSystemPrompt = getCurrentSystemPrompt(context.messages);
+      // Kiro carries one leading prompt inside its first user message. Strip
+      // system entries BEFORE computing history/current-turn boundaries.
+      const messages = normalizeMessages(context.messages);
       const endpoint = model.baseUrl || "https://q.us-east-1.amazonaws.com/";
       // The dynamic provider only reaches this stream with a validated exact
       // wire ID. Keep the legacy conversion solely for direct standalone
@@ -409,12 +436,12 @@ export function streamKiro(
         reasoningHidden,
         reasoning: options?.reasoning,
         messageCount: context.messages.length,
-        toolCount: context.tools?.length ?? 0,
-        hasSystemPrompt: !!context.systemPrompt,
+        toolCount: tools.length,
+        hasSystemPrompt: !!currentSystemPrompt,
         sessionId: options?.sessionId,
       });
 
-      let systemPrompt = context.systemPrompt ?? "";
+      let systemPrompt = currentSystemPrompt;
       // Skip the `<thinking_mode>` directive when the provider hides
       // reasoning — the directive is a no-op there and costs prompt tokens.
       if (thinkingEnabled && !reasoningHidden) {
@@ -430,14 +457,14 @@ export function streamKiro(
       while (retryCount <= MAX_RETRIES) {
         if (options?.signal?.aborted) throw options.signal.reason;
 
-        const normalized = normalizeMessages(context.messages);
+        const normalized = messages;
         const toolUseIds = new ToolUseIdMapper();
         const {
           history,
           systemPrepended,
           currentMsgStartIdx,
         } = buildHistory(normalized, kiroModelId, systemPrompt, toolUseIds);
-        const useCachePoints = cachePointsEnabled();
+        const useCachePoints = cachePointsEnabled(options?.env);
         if (useCachePoints) applyCachePoints(history);
 
         const currentMessages = normalized.slice(currentMsgStartIdx);
@@ -536,11 +563,11 @@ export function streamKiro(
         }
 
         let uimc: { toolResults?: KiroToolResult[]; tools?: KiroToolSpec[] } | undefined;
-        if (currentToolResults.length > 0 || (context.tools && context.tools.length > 0)) {
+        if (currentToolResults.length > 0 || tools.length > 0) {
           uimc = {};
           if (currentToolResults.length > 0) uimc.toolResults = currentToolResults;
-          if (context.tools?.length) {
-            uimc.tools = convertToolsToKiro(context.tools);
+          if (tools.length > 0) {
+            uimc.tools = convertToolsToKiro(tools);
           }
         }
 
@@ -569,22 +596,6 @@ export function streamKiro(
         };
 
         // -- HTTP request with capacity-retry inner loop -----------------
-        // Emit the hidden-reasoning indicator before the fetch so the live
-        // indicator covers the server-side deliberation window (which is
-        // where the wait actually happens on reasoning models).
-        if (reasoningHidden && thinkingEnabled && hiddenThinkingIndex === null) {
-          hiddenThinkingIndex = emitHiddenReasoningStart(output, stream);
-          hiddenMarkerEmitted = false;
-          const idx = hiddenThinkingIndex;
-          hiddenMarkerTimer = setTimeout(() => {
-            hiddenMarkerTimer = null;
-            if (hiddenThinkingIndex === idx && !hiddenMarkerEmitted) {
-              emitHiddenReasoningMarker(output, stream, idx);
-              hiddenMarkerEmitted = true;
-            }
-          }, HIDDEN_REASONING_COUNTDOWN_MS);
-        }
-
         let response: Response | undefined;
         let firstEventDeadline: ReturnType<typeof createFirstEventDeadline> | undefined;
         let firstEventStartedAt = 0;
@@ -607,9 +618,42 @@ export function streamKiro(
             toolResultCount: currentToolResults.length,
           });
 
+          response = undefined;
           try {
+            let payload: unknown = request;
+            if (options?.onPayload) {
+              // Historical arguments and tool schemas can reference caller
+              // objects. Give the mutable payload hook detached wire data.
+              payload = JSON.parse(JSON.stringify(request));
+              const replacement = await awaitWithAbort(
+                Promise.resolve(options.onPayload(payload, model)),
+                firstEventDeadline.signal,
+              );
+              if (replacement !== undefined) payload = replacement;
+            }
+            // A synchronous hook can itself abort the caller.
+            firstEventDeadline.signal.throwIfAborted();
+            const body = JSON.stringify(payload);
+            if (!started) {
+              started = true;
+              stream.push({ type: "start", partial: output });
+            }
+            // Keep the hidden-reasoning indicator before fetch so it covers
+            // server-side deliberation, but only after request setup succeeds.
+            if (reasoningHidden && thinkingEnabled && hiddenThinkingIndex === null) {
+              hiddenThinkingIndex = emitHiddenReasoningStart(output, stream);
+              hiddenMarkerEmitted = false;
+              const idx = hiddenThinkingIndex;
+              hiddenMarkerTimer = setTimeout(() => {
+                hiddenMarkerTimer = null;
+                if (hiddenThinkingIndex === idx && !hiddenMarkerEmitted) {
+                  emitHiddenReasoningMarker(output, stream, idx);
+                  hiddenMarkerEmitted = true;
+                }
+              }, HIDDEN_REASONING_COUNTDOWN_MS);
+            }
             response = await awaitWithAbort(
-              fetch(endpoint, {
+              (options?.fetch ?? globalThis.fetch)(endpoint, {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/x-amz-json-1.0",
@@ -624,14 +668,32 @@ export function streamKiro(
                   "x-amz-user-agent": ua,
                   "user-agent": ua,
                 },
-                body: JSON.stringify(request),
+                body,
                 // Do not forward an API key if a service endpoint redirects.
                 redirect: "error",
                 signal: firstEventDeadline.signal,
               }),
               firstEventDeadline.signal,
             );
+            if (options?.onResponse) {
+              const metadata = {
+                status: response.status,
+                headers: Object.fromEntries(response.headers.entries()),
+              };
+              await awaitWithAbort(
+                Promise.resolve(options.onResponse(metadata, model)),
+                firstEventDeadline.signal,
+              );
+            }
+            firstEventDeadline.signal.throwIfAborted();
           } catch (error) {
+            // Hooks run before acquiring a reader. Cancel an unconsumed body
+            // on failure/cancellation without waiting for its cancel promise.
+            try {
+              void response?.body?.cancel().catch(() => {});
+            } catch {
+              // Best effort for non-conforming response getters.
+            }
             if (firstEventDeadline.timedOut) {
               firstEventTimedOut = true;
               break;
@@ -887,7 +949,7 @@ export function streamKiro(
           currentToolCall = null;
         };
 
-        const processEvents = (events: ReturnType<typeof parser.push>) => {
+        const processEvents = async (events: ReturnType<typeof parser.push>) => {
           if (!gotFirstToken && events.length > 0) {
             gotFirstToken = true;
             finishAttemptDeadline.disarmFirstEventTimer();
@@ -907,6 +969,21 @@ export function streamKiro(
           }
 
           for (const event of events) {
+            try {
+              if (options?.onProviderStreamEvent) {
+                await awaitWithAbort(
+                  Promise.resolve(options.onProviderStreamEvent(event, model)),
+                  firstEventDeadline!.signal,
+                );
+              }
+              firstEventDeadline!.signal.throwIfAborted();
+            } catch (error) {
+              // A deadline-cancelled observer follows the same idle timeout
+              // path as a stalled read. Genuine hook failures stay terminal,
+              // and caller cancellation must never become a retryable timeout.
+              if (idleCancelled && !options?.signal?.aborted && error === firstEventDeadline!.signal.reason) return;
+              throw error;
+            }
             switch (event.type) {
               case "contextUsage": {
                 const pct = event.data.contextUsagePercentage;
@@ -1056,17 +1133,17 @@ export function streamKiro(
               throw error;
             }
           }
-          processEvents(events);
-          if (streamError || toolCallError) break;
+          await processEvents(events);
+          if (idleCancelled || streamError || toolCallError) break;
         }
 
         if (!firstTokenTimedOut && !idleCancelled && !streamError && !toolCallError) {
           // Flush a final split UTF-8 sequence before deciding whether the
           // provider ended cleanly, then reject a recognized partial frame.
           const trailingDecoded = decoder.decode();
-          if (trailingDecoded) processEvents(parser.push(trailingDecoded));
-          if (!toolCallError) parser.finish();
-          if (!toolCallError) rejectIncompleteToolCall();
+          if (trailingDecoded) await processEvents(parser.push(trailingDecoded));
+          if (!idleCancelled && !toolCallError) parser.finish();
+          if (!idleCancelled && !toolCallError) rejectIncompleteToolCall();
         }
 
         if (toolCallError) {
@@ -1173,6 +1250,7 @@ export function streamKiro(
           output.stopReason = emittedToolCalls > 0 ? "toolUse" : "stop";
         }
 
+        options?.signal?.throwIfAborted();
         stream.push({
           type: "done",
           reason: output.stopReason as "stop" | "length" | "toolUse",

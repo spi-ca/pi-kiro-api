@@ -4,6 +4,11 @@ import { tmpdir } from "node:os";
 
 type ExpectedVersions = Record<string, string>;
 
+/** chord is part of Pi's runtime graph even though it lacks the pi- prefix. */
+export function isPiRuntimePackage(name: string): boolean {
+  return name === "@earendil-works/chord" || name.startsWith("@earendil-works/pi-");
+}
+
 function packageVersion(path: string): { name: string; version: string } {
   const value = JSON.parse(readFileSync(path, "utf8")) as { name?: unknown; version?: unknown };
   if (typeof value.name !== "string" || typeof value.version !== "string") throw new Error(`invalid package manifest: ${path}`);
@@ -30,7 +35,7 @@ export function installedPiPackages(root: string): Map<string, Set<string>> {
     const manifest = join(directory, "package.json");
     if (!existsSync(manifest)) return;
     const pkg = packageVersion(manifest);
-    if (!pkg.name.startsWith("@earendil-works/pi-")) return;
+    if (!isPiRuntimePackage(pkg.name)) return;
     const expectedDirectoryName = pkg.name.slice("@earendil-works/".length);
     if (directory.split("/").at(-1) !== expectedDirectoryName) {
       throw new Error(`unexpected Pi package identity in ${manifest}: ${pkg.name}`);
@@ -112,13 +117,22 @@ function selfTest(): void {
     mkdirSync(join(nodeModules, ".bun/cycle"), { recursive: true });
     symlinkSync(nodeModules, join(nodeModules, ".bun/cycle/node_modules"));
 
-    const expected = { "@earendil-works/pi-ai": "1.2.3", "@earendil-works/pi-tui": "1.2.3" };
+    const chord = join(nodeModules, "@earendil-works/chord");
+    writePackage(chord, "@earendil-works/chord", "1.2.3");
+    const expected = { "@earendil-works/pi-ai": "1.2.3", "@earendil-works/pi-tui": "1.2.3", "@earendil-works/chord": "1.2.3" };
     verifyPiGraph(nodeModules, expected, ["@earendil-works/pi-ai"]);
     writeFileSync(join(nested, "package.json"), '{"name":"@earendil-works/pi-tui","version":"9.9.9"}\n');
     expectFailure(() => verifyPiGraph(nodeModules, expected, ["@earendil-works/pi-ai"]), "a mismatched Pi package nested below a non-Pi scope");
     writeFileSync(join(nested, "package.json"), '{"name":"@earendil-works/pi-tui","version":"1.2.3"}\n');
     expectFailure(() => verifyPiGraph(nodeModules, { ...expected, "@earendil-works/pi-client": "1.2.3" }, ["@earendil-works/pi-ai"]), "a missing expected Pi dependency");
-    console.log("synthetic generic scoped and cyclic Bun graph verified");
+    writeFileSync(join(chord, "package.json"), '{"name":"@earendil-works/chord","version":"9.9.9"}\n');
+    expectFailure(() => verifyPiGraph(nodeModules, expected, []), "a mismatched chord dependency");
+    writeFileSync(join(chord, "package.json"), '{"name":"@earendil-works/chord","version":"1.2.3"}\n');
+    const { "@earendil-works/chord": _chord, ...withoutChord } = expected;
+    expectFailure(() => verifyPiGraph(nodeModules, withoutChord, []), "an unexpected chord dependency");
+    rmSync(chord, { recursive: true });
+    expectFailure(() => verifyPiGraph(nodeModules, expected, []), "a missing chord dependency");
+    console.log("synthetic scoped/cyclic Bun graph and mismatched/unexpected/missing chord verified");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -128,7 +142,7 @@ function main(): void {
   if (process.argv[2] === "--self-test") return selfTest();
   const expected = JSON.parse(process.env.PI_GRAPH_EXPECTED ?? "") as ExpectedVersions;
   const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { devDependencies?: Record<string, string> };
-  const declared = Object.keys(pkg.devDependencies ?? {}).filter((name) => name.startsWith("@earendil-works/pi-"));
+  const declared = Object.keys(pkg.devDependencies ?? {}).filter(isPiRuntimePackage);
   if (declared.length === 0) throw new Error("no declared Pi development packages");
   verifyPiGraph(join(process.cwd(), "node_modules"), expected, declared);
 }

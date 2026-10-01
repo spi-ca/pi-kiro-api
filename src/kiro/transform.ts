@@ -16,13 +16,14 @@ import type {
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
 
-/** Drop assistant messages that ended in error/aborted — partial turns
- *  shouldn't be replayed. */
+/** Strip system state before indexing turns and drop error/aborted partial
+ *  assistant turns, which shouldn't be replayed. */
 export function normalizeMessages(messages: Message[]): Message[] {
   return messages.filter(
     (msg) =>
-      msg.role !== "assistant" ||
-      (msg.stopReason !== "error" && msg.stopReason !== "aborted"),
+      msg.role !== "system" &&
+      (msg.role !== "assistant" ||
+        (msg.stopReason !== "error" && msg.stopReason !== "aborted")),
   );
 }
 

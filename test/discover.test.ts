@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { discoverKiroModels } from "../src/kiro/discover.ts";
 import { toKiroModelId } from "../src/kiro/models.ts";
 import { createKiroProvider } from "../src/kiro/provider-auth.ts";
@@ -109,22 +110,18 @@ describe("Kiro model discovery", () => {
       async () => discoverKiroModels("ksk_test-key", BASE_URL),
     );
     expect(provider.getModels()).toEqual([]);
-    const stream = provider.streamSimple(
-      {
-        id: "claude-sonnet-4-6",
-        name: "Claude Sonnet 4.6",
-        api: "kiro-api",
-        provider: "kiro-api-key",
-        baseUrl: BASE_URL,
-        reasoning: true,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 200_000,
-        maxTokens: 8_192,
-      },
-      { messages: [], tools: [] },
-      { apiKey: "ksk_test-key" },
-    );
+    const stream = provider.streamSimple({
+      id: "claude-sonnet-4-6",
+      name: "Claude Sonnet 4.6",
+      api: "kiro-api",
+      provider: "kiro-api-key",
+      baseUrl: BASE_URL,
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200_000,
+      maxTokens: 8_192,
+    }, normalizeContext({ messages: [], tools: [] }), { apiKey: "ksk_test-key" },);
     expect(await stream.result()).toEqual(
       expect.objectContaining({
         stopReason: "error",

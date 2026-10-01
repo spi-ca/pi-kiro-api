@@ -1,8 +1,8 @@
 # Configuration and authentication
 
 Install this fork with
-`pi install git:github.com/spi-ca/pi-kiro-api@v20260907-1`, then restart Pi
-or reload packages as appropriate for the active session. npm installation is
+`pi install git:github.com/spi-ca/pi-kiro-api@v20261001-1`, then restart Pi
+or run `/reload` in an active session. npm installation is
 not supported.
 
 ## Interactive login
@@ -70,9 +70,10 @@ provider. It cannot bootstrap `ListAvailableModels` before the provider is
 registered, so `--api-key` alone does not produce an initial Kiro catalog. Use
 `/login kiro-api-key` (recommended) or set `KIRO_API_KEY` before Pi starts.
 
-This holds for 0.84.1 through 0.84.4. Pi 0.84.4 changed nothing in dynamic
-provider registration or native credential resolution that removes this constraint,
-so it remains unchanged rather than fixed.
+The Pi 0.99.2 migration does not add a bootstrap path: stream dispatch still
+requires a validated credential-scoped catalog. Pi's current CLI also requires
+`--api-key` to accompany a model selected through `--model` or `--models`.
+This migration was tested with mocked requests, not live credential acceptance.
 
 A runtime `--api-key` may happen to work only when Pi already has a persisted
 catalog matching that exact key and region. It is not a supported bootstrap
@@ -146,6 +147,20 @@ ID, discovery rejects the ambiguous catalog. Dynamic provider catalogs never
 use the legacy fallback: missing mappings invalidate the entry. The fallback
 remains only in the standalone vendored stream path for its hand-maintained
 static/compatibility models, where no dynamic entitlement catalog is claimed.
+
+## Transcript prompt and tool updates
+
+Native streams receive Pi's normalized transcript, not separate `systemPrompt`
+and `tools` fields. The provider replays the initial and later system messages,
+including named-section replacement/removal and tool additions/removals. Kiro
+has no mid-conversation system-message field, so the resulting current prompt
+is folded into the first user message. System entries are removed before turn
+indexing; past calls/results remain replayable even if that tool is no longer
+active. Incoming transcript messages are not modified.
+
+The standalone exported `streamKiro` also accepts the shorthand `Context` form
+and normalizes it at its public boundary. This is not an older-Pi runtime shim;
+the required replay helpers must exist in the host (tested: 0.99.2 and 0.87.1).
 
 ## Thinking levels
 
@@ -300,6 +315,17 @@ Sanitization covers service-reported errors from both transports:
 
 In every case arbitrary service `message` and `errorMessage` prose is omitted.
 Sanitization does not extend to arbitrary application logs or payloads.
+Pi request-inspection hooks intentionally receive the request payload, response
+status/headers, and parsed `KiroStreamEvent` objects before assistant-message
+normalization (not original HTTP bytes). Treat those hooks as trusted code;
+they can inspect sensitive content. Hooks are awaited in order. Payload hooks
+can replace the body; response hooks run before body consumption, including
+on non-OK responses. Hanging asynchronous hooks are bounded by caller cancellation and the
+existing first-event/idle deadlines. Cancellation stops waiting and further
+normalization; it cannot forcibly stop arbitrary callback work. Payload hooks
+receive detached wire data so payload mutations do not change caller-owned
+tool schemas or historical arguments. Callback rejection ends the stream rather
+than silently retrying it. Pi 0.87.1 has no host parsed-event observer.
 
 - Treat `KIRO_API_KEY` as a secret. Do not commit it, put it in shell history,
   or paste it into logs or issue reports.

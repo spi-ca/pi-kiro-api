@@ -6,4 +6,5 @@ The root [README](../README.md) provides installation and a quick start.
   environment use, region and precedence rules, scoped startup-cache versus
   fail-closed network discovery, thinking-level budgets, and secret handling.
 - [Development](./development.md) — Bun workflow, verification commands,
-  source layout, and test scope.
+  source layout, transcript compatibility, and test scope.
+- [Changelog](../CHANGELOG.md) — release notes and migration scope.
