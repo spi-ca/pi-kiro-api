@@ -1,7 +1,8 @@
 # pi-kiro-api
 
 A [Pi](https://pi.dev) native provider for Kiro API keys, built and verified
-against Pi **0.84.4**. It uses provider-owned
+against Pi **0.99.2**, with an older transcript compatibility lane at
+**0.87.1**. It uses provider-owned
 authentication and Kiro's
 `ListAvailableModels` catalog for the active key and AWS region. The streaming
 implementation under `src/kiro/` is vendored from
@@ -12,7 +13,7 @@ implementation under `src/kiro/` is vendored from
 The supported distributable path is this Git fork:
 
 ```bash
-pi install git:github.com/spi-ca/pi-kiro-api@v20260907-1
+pi install git:github.com/spi-ca/pi-kiro-api@v20261001-1
 # or, for local development
 pi install /path/to/pi-kiro-api
 ```
@@ -47,7 +48,7 @@ credential retains precedence over the environment. Set `PI_OFFLINE=1` (or use
 Pi's `--offline`) to skip that ambient network preload while still registering
 the provider.
 
-As of Pi 0.84.4, `--api-key` alone cannot bootstrap this dynamic provider's
+`--api-key` alone is not a supported bootstrap path for this dynamic provider's
 initial `ListAvailableModels` catalog. Use `/login kiro-api-key` (recommended)
 or set `KIRO_API_KEY` before Pi starts. A changed `--api-key` also fails closed
 by clearing a catalog scoped to a different key; an already matching cache may
@@ -64,6 +65,16 @@ CI values through a secret manager.
 - [Development](./docs/development.md) — Bun setup, checks, packaging, and the
   non-network test strategy.
 - [Documentation index](./docs/README.md)
+- [Changelog](./CHANGELOG.md)
+
+Pi 0.99.2 prompt sections and tool updates are replayed from the normalized
+transcript. Kiro accepts only one leading prompt, so later system updates are
+collapsed into that prompt before history and current-turn conversion. The
+provider honors payload replacement, response metadata, and parsed-stream
+observation hooks with cancellation and existing deadlines. Pi 0.87.1 does not
+supply the parsed-event observation hook; 0.85.1 is no longer a supported lane
+because it lacks the required transcript replay helpers. Wildcard host peers
+are Pi's packaging convention, not a claim that every Pi version is supported.
 
 ## Attribution and license
 

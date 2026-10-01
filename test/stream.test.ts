@@ -1332,3 +1332,458 @@ test("does not retry after externally visible provider text or tool output", asy
     }
   }
 });
+
+test("awaits payload replacement and response metadata before consuming the body", async () => {
+  const order: string[] = [];
+  let sent: unknown;
+  let receivedResponse!: Response;
+  const requestFetch = async (_url: RequestInfo | URL, init?: RequestInit) => {
+    order.push("fetch");
+    sent = JSON.parse(String(init?.body));
+    receivedResponse = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"content":"ok"}{"contextUsagePercentage":1}'));
+        controller.close();
+      },
+    }), { status: 200, headers: { "x-request-id": "test-id" } });
+    return receivedResponse;
+  };
+  const result = await streamKiro(MODEL, { messages: [] }, {
+    apiKey: "test-key",
+    fetch: requestFetch as typeof fetch,
+    async onPayload(payload, model) {
+      expect(model).toBe(MODEL);
+      expect(payload).toHaveProperty("conversationState");
+      order.push("payload");
+      await Promise.resolve();
+      return { replacement: true };
+    },
+    async onResponse(metadata, model) {
+      order.push("response");
+      expect(model).toBe(MODEL);
+      expect(metadata.status).toBe(200);
+      expect(metadata.headers["x-request-id"]).toBe("test-id");
+      expect(metadata).not.toHaveProperty("body");
+      expect(receivedResponse.bodyUsed).toBe(false);
+      expect(receivedResponse.body?.locked).toBe(false);
+      await Promise.resolve();
+      expect(receivedResponse.bodyUsed).toBe(false);
+    },
+    async onProviderStreamEvent(event, model) {
+      order.push("event");
+      expect(model).toBe(MODEL);
+      await Promise.resolve();
+      expect(event).toHaveProperty("type");
+    },
+  }).result();
+  expect(sent).toEqual({ replacement: true });
+  expect(order).toEqual(["payload", "fetch", "response", "event", "event"]);
+  expect(result.content).toEqual([{ type: "text", text: "ok" }]);
+});
+
+test("payload hooks keep mutation on undefined and accept falsy replacements", async () => {
+  for (const replacement of [undefined, null, false, 0, ""] as const) {
+    let sent: unknown;
+    await streamKiro(MODEL, { messages: [] }, {
+      apiKey: "test-key",
+      fetch: (async (_url: RequestInfo | URL, init?: RequestInit) => {
+        sent = JSON.parse(String(init?.body));
+        return new Response('{"content":"ok"}{"contextUsagePercentage":1}');
+      }) as typeof fetch,
+      onPayload(payload) {
+        (payload as { agentMode: string }).agentMode = "mutated";
+        return replacement;
+      },
+    }).result();
+    if (replacement === undefined) expect(sent).toHaveProperty("agentMode", "mutated");
+    else expect(sent).toBe(replacement);
+  }
+});
+
+test("reports non-OK response metadata before reading its error body", async () => {
+  let cancelled = false;
+  const events = await collectEvents(streamKiro(MODEL, { messages: [] }, {
+    apiKey: "test-key",
+    fetch: (async () => new Response(new ReadableStream({
+      pull() {},
+      cancel() { cancelled = true; },
+    }), { status: 403, headers: { "x-request-id": "rejected-id" } })) as unknown as typeof fetch,
+    onResponse(metadata) {
+      expect(metadata.status).toBe(403);
+      expect(metadata.headers["x-request-id"]).toBe("rejected-id");
+      throw new Error("observer failed before error body");
+    },
+  }));
+  expect(cancelled).toBe(true);
+  expect(events.at(-1)).toHaveProperty("error.errorMessage", "observer failed before error body");
+  expect(events.filter((event) => event.type === "error")).toHaveLength(1);
+});
+
+test("observes parsed events in order before normalizing each block", async () => {
+  let release!: () => void;
+  let entered!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const observed: unknown[] = [];
+  const delivered: string[] = [];
+  const response = streamKiro(MODEL, { messages: [] }, {
+    apiKey: "test-key",
+    fetch: (async () => new Response('{"content":"first"}{"content":"second"}{"name":"lookup","toolUseId":"id","input":"{\\"items\\":[1,true]}","stop":true}{"usage":{"inputTokens":7,"outputTokens":3}}{"contextUsagePercentage":1}{"followupPrompt":"ignored"}')) as unknown as typeof fetch,
+    async onProviderStreamEvent(event) {
+      observed.push(event);
+      if (observed.length === 1) {
+        entered();
+        await gate;
+      }
+    },
+  });
+  const collecting = (async () => {
+    for await (const event of response) delivered.push(event.type);
+  })();
+  await enteredPromise;
+  expect(delivered).not.toContain("text_start");
+  expect(observed).toEqual([{ type: "content", data: "first" }]);
+  release();
+  await collecting;
+  expect(observed).toEqual([
+    { type: "content", data: "first" },
+    { type: "content", data: "second" },
+    { type: "toolUse", data: { name: "lookup", toolUseId: "id", input: '{"items":[1,true]}', stop: true } },
+    { type: "usage", data: { inputTokens: 7, outputTokens: 3 } },
+    { type: "contextUsage", data: { contextUsagePercentage: 1 } },
+    { type: "followupPrompt", data: "ignored" },
+  ]);
+  const result = await response.result();
+  expect(result.usage.input).toBe(7);
+  expect(result.content).toEqual([
+    { type: "text", text: "firstsecond" },
+    { type: "toolCall", id: "id", name: "lookup", arguments: { items: [1, true] } },
+  ]);
+});
+
+test("callback rejections terminate once, cancel bodies, and never retry", async () => {
+  for (const phase of ["onPayload", "onResponse", "onProviderStreamEvent"] as const) {
+    await withFakeClock(async (clock) => {
+      let calls = 0;
+      let cancelled = false;
+      const response = streamKiro(MODEL, { messages: [] }, {
+        apiKey: "test-key",
+        fetch: (async () => {
+          calls++;
+          return new Response(new ReadableStream({
+            start(controller) { controller.enqueue(new TextEncoder().encode('{"content":"not yet normalized"}')); },
+            cancel() { cancelled = true; },
+          }));
+        }) as unknown as typeof fetch,
+        [phase]: async () => { throw new Error(`${phase} failed`); },
+      });
+      const events = await collectEvents(response);
+      expect(calls).toBe(phase === "onPayload" ? 0 : 1);
+      expect(cancelled).toBe(phase !== "onPayload");
+      expect(events.filter((event) => event.type === "error")).toHaveLength(1);
+      expect(events).not.toContainEqual(expect.objectContaining({ type: "done" }));
+      expect((await response.result()).content).toEqual([]);
+      expect((await response.result()).errorMessage).toBe(`${phase} failed`);
+      expect(events.filter((event) => event.type === "start")).toHaveLength(phase === "onPayload" ? 0 : 1);
+      expect(clock.pending()).toBe(0);
+    });
+  }
+});
+
+test("caller cancellation bounds hanging callbacks and ignores their late completion", async () => {
+  for (const phase of ["onPayload", "onResponse", "onProviderStreamEvent"] as const) {
+    await withFakeClock(async (clock) => {
+      const controller = new AbortController();
+      let entered!: () => void;
+      let release!: () => void;
+      const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let calls = 0;
+      let cancelled = false;
+      const response = streamKiro(MODEL, { messages: [] }, {
+        apiKey: "test-key", signal: controller.signal,
+        fetch: (async () => {
+          calls++;
+          return new Response(new ReadableStream({
+            start(c) { c.enqueue(new TextEncoder().encode('{"content":"must not appear"}')); },
+            cancel() { cancelled = true; },
+          }));
+        }) as unknown as typeof fetch,
+        [phase]: () => { entered(); return gate; },
+      });
+      const collecting = collectEvents(response);
+      await enteredPromise;
+      controller.abort(new Error("cancel hook"));
+      const events = await collecting;
+      expect(events.at(-1)).toHaveProperty("reason", "aborted");
+      expect((await response.result()).content).toEqual([]);
+      expect(calls).toBe(phase === "onPayload" ? 0 : 1);
+      expect(cancelled).toBe(phase !== "onPayload");
+      expect(clock.pending()).toBe(0);
+      const count = events.length;
+      release();
+      await flushMicrotasks();
+      expect(events).toHaveLength(count);
+    });
+  }
+});
+
+test("first-event deadlines bound hanging payload/response hooks through all retries", async () => {
+  for (const phase of ["onPayload", "onResponse"] as const) {
+    await withFakeClock(async (clock) => {
+      let entered = 0;
+      let calls = 0;
+      let cancellations = 0;
+      const response = streamKiro(MODEL, { messages: [] }, {
+        apiKey: "test-key",
+        fetch: (async () => {
+          calls++;
+          return new Response(new ReadableStream({ cancel() { cancellations++; } }));
+        }) as unknown as typeof fetch,
+        [phase]: () => { entered++; return new Promise<void>(() => {}); },
+      });
+      const collecting = collectEvents(response);
+      for (let attempt = 0; attempt < 4; attempt++) {
+        for (let i = 0; i < 4; i++) await flushMicrotasks();
+        expect(entered).toBe(attempt + 1);
+        clock.advance(90_000);
+        for (let i = 0; i < 4; i++) await flushMicrotasks();
+        if (attempt < 3) clock.advance(1000 * 2 ** attempt);
+      }
+      const events = await collecting;
+      expect(events.filter((event) => event.type === "error")).toHaveLength(1);
+      expect((await response.result()).errorMessage).toContain("first token timeout");
+      expect(calls).toBe(phase === "onPayload" ? 0 : 4);
+      expect(cancellations).toBe(calls);
+      expect(clock.pending()).toBe(0);
+    });
+  }
+});
+
+test("idle timeout retries invisible reader and first-observer stalls, then recovers", async () => {
+  for (const stall of ["reader", "observer"] as const) {
+    await withFakeClock(async (clock) => {
+      let entered!: () => void;
+      const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let calls = 0;
+      let cancellations = 0;
+      const response = streamKiro(MODEL, { messages: [] }, {
+        apiKey: "test-key",
+        fetch: (async () => {
+          calls++;
+          if (calls === 2) return new Response('{"content":"recovered"}{"contextUsagePercentage":1}');
+          let reads = 0;
+          return {
+            ok: true,
+            body: {
+              getReader: () => ({
+                read() {
+                  if (++reads === 1) return Promise.resolve({ done: false, value: new TextEncoder().encode(
+                    stall === "reader" ? '{"contextUsagePercentage":1}' : '{"content":"discarded"}',
+                  ) });
+                  entered();
+                  return new Promise<never>(() => {});
+                },
+                cancel() { cancellations++; return new Promise<never>(() => {}); },
+              }),
+            },
+          } as unknown as Response;
+        }) as unknown as typeof fetch,
+        onProviderStreamEvent() {
+          if (stall === "observer" && calls === 1) { entered(); return gate; }
+        },
+      });
+      const collecting = collectEvents(response);
+      await enteredPromise;
+      // The parsed event disarms the first-event timer; idle is now the bound.
+      clock.advance(300_000);
+      for (let i = 0; i < 4; i++) await flushMicrotasks();
+      expect(calls).toBe(1);
+      expect(cancellations).toBe(1);
+      clock.advance(999);
+      await flushMicrotasks();
+      expect(calls).toBe(1);
+      clock.advance(1);
+      const events = await collecting;
+      expect(calls).toBe(2);
+      expect((await response.result()).content).toEqual([{ type: "text", text: "recovered" }]);
+      expect(events.filter((event) => event.type === "start")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "text_start")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "done")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "error")).toHaveLength(0);
+      expect(clock.pending()).toBe(0);
+      const count = events.length;
+      release();
+      await flushMicrotasks();
+      expect(events).toHaveLength(count);
+      expect((await response.result()).content).toEqual([{ type: "text", text: "recovered" }]);
+    });
+  }
+});
+
+test("invisible reader and first-observer idle stalls exhaust the same three retries", async () => {
+  for (const stall of ["reader", "observer"] as const) {
+    await withFakeClock(async (clock) => {
+      let calls = 0;
+      let entered = 0;
+      let cancellations = 0;
+      const response = streamKiro(MODEL, { messages: [] }, {
+        apiKey: "test-key",
+        fetch: (async () => {
+          calls++;
+          let reads = 0;
+          return {
+            ok: true,
+            body: {
+              getReader: () => ({
+                read() {
+                  if (++reads === 1) return Promise.resolve({ done: false, value: new TextEncoder().encode(
+                    stall === "reader" ? '{"contextUsagePercentage":1}' : '{"content":"not normalized"}',
+                  ) });
+                  entered++;
+                  return new Promise<never>(() => {});
+                },
+                cancel() { cancellations++; return new Promise<never>(() => {}); },
+              }),
+            },
+          } as unknown as Response;
+        }) as unknown as typeof fetch,
+        onProviderStreamEvent() {
+          if (stall === "observer") { entered++; return new Promise<void>(() => {}); }
+        },
+      });
+      const collecting = collectEvents(response);
+      for (let attempt = 0; attempt < 4; attempt++) {
+        for (let i = 0; i < 4; i++) await flushMicrotasks();
+        expect(calls).toBe(attempt + 1);
+        expect(entered).toBe(attempt + 1);
+        clock.advance(300_000);
+        for (let i = 0; i < 4; i++) await flushMicrotasks();
+        expect(cancellations).toBe(attempt + 1);
+        if (attempt < 3) {
+          // Preserve the established 1s, 2s, 4s retry backoff.
+          clock.advance(1000 * 2 ** attempt - 1);
+          await flushMicrotasks();
+          expect(calls).toBe(attempt + 1);
+          clock.advance(1);
+        }
+      }
+      const events = await collecting;
+      expect(calls).toBe(4);
+      expect(events.filter((event) => event.type === "start")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "error")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "done")).toHaveLength(0);
+      expect((await response.result()).content).toEqual([]);
+      expect((await response.result()).errorMessage).toBe("Kiro API error: idle timeout after max retries");
+      expect(clock.pending()).toBe(0);
+    });
+  }
+});
+
+test("idle deadline bounds a hanging parsed-event observer and closes visible text", async () => {
+  await withFakeClock(async (clock) => {
+    let entered!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    let observed = 0;
+    let calls = 0;
+    let cancelled = false;
+    const response = streamKiro(MODEL, { messages: [] }, {
+      apiKey: "test-key",
+      fetch: (async () => {
+        calls++;
+        return new Response(new ReadableStream({
+          start(c) { c.enqueue(new TextEncoder().encode('{"content":"visible"}{"content":"blocked"}')); },
+          cancel() { cancelled = true; },
+        }));
+      }) as unknown as typeof fetch,
+      onProviderStreamEvent() {
+        observed++;
+        if (observed === 2) { entered(); return new Promise<void>(() => {}); }
+      },
+    });
+    const collecting = collectEvents(response);
+    await enteredPromise;
+    clock.advance(300_000);
+    const events = await collecting;
+    expect(cancelled).toBe(true);
+    expect(calls).toBe(1);
+    expect((await response.result()).errorMessage).toBe("Kiro API error: idle timeout after provider output");
+    expect((await response.result()).content).toEqual([{ type: "text", text: "visible" }]);
+    expect(events.filter((event) => event.type === "text_start")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "text_end")).toHaveLength(1);
+    expect(events.at(-1)).toHaveProperty("type", "error");
+    expect(clock.pending()).toBe(0);
+  });
+});
+
+test("a synchronously aborting hook cannot normalize events or leak a rejected promise", async () => {
+  for (const phase of ["onPayload", "onResponse", "onProviderStreamEvent"] as const) {
+    const controller = new AbortController();
+    const response = streamKiro(MODEL, { messages: [] }, {
+      apiKey: "test-key", signal: controller.signal,
+      fetch: (async () => new Response('{"content":"must not appear"}')) as unknown as typeof fetch,
+      [phase]: () => {
+        controller.abort(new Error("sync hook abort"));
+        return Promise.reject(new Error("late hook rejection"));
+      },
+    });
+    const events = await collectEvents(response);
+    expect(events.at(-1)).toHaveProperty("reason", "aborted");
+    expect((await response.result()).content).toEqual([]);
+    expect((await response.result()).errorMessage).toBe("sync hook abort");
+    await flushMicrotasks();
+  }
+});
+
+test("observes error frames before reducing them to safe Pi errors", async () => {
+  const observed: unknown[] = [];
+  const response = streamKiro(MODEL, { messages: [] }, {
+    apiKey: "test-key",
+    fetch: (async () => new Response('{"content":"visible"}{"error":"ServiceFailure","message":"private prose"}')) as unknown as typeof fetch,
+    onProviderStreamEvent(event) { observed.push(event); },
+  });
+  await collectEvents(response);
+  expect(observed).toEqual([
+    { type: "content", data: "visible" },
+    { type: "error", data: { error: "ServiceFailure", message: "private prose" } },
+  ]);
+  expect((await response.result()).errorMessage).toContain("ServiceFailure");
+  expect((await response.result()).errorMessage).not.toContain("private prose");
+});
+
+test("payload mutation cannot modify caller-owned tool schemas or historical arguments", async () => {
+  const args = Object.freeze({ items: Object.freeze(["original"]) });
+  const parameters = Object.freeze({ type: "object", properties: Object.freeze({ value: Object.freeze({ type: "string" }) }) });
+  const context = {
+    tools: [{ name: "lookup", description: "lookup", parameters }],
+    messages: [
+      { role: "user", content: "question", timestamp: 0 },
+      { role: "assistant", content: [{ type: "toolCall", id: "id", name: "lookup", arguments: args }], api: MODEL.api, provider: MODEL.provider, model: MODEL.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: 1 },
+      { role: "toolResult", toolCallId: "id", toolName: "lookup", content: [{ type: "text", text: "result" }], isError: false, timestamp: 2 },
+    ] as Message[],
+  };
+  const snapshot = structuredClone(context);
+  let sent: { conversationState: { history: Array<{ assistantResponseMessage?: { toolUses: Array<{ input: { items: string[] } }> } }> } } | undefined;
+  const result = await streamKiro(MODEL, context, {
+    apiKey: "test-key",
+    fetch: (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      sent = JSON.parse(String(init?.body));
+      return new Response('{"content":"ok"}{"contextUsagePercentage":1}');
+    }) as typeof fetch,
+    onPayload(payload) {
+      const request = payload as {
+        conversationState: {
+          history: Array<{ assistantResponseMessage?: { toolUses: Array<{ input: { items: string[] } }> } }>;
+          currentMessage: { userInputMessage: { userInputMessageContext: { tools: Array<{ toolSpecification: { inputSchema: { json: { properties: { value: { type: string } } } } } }> } } };
+        };
+      };
+      request.conversationState.history[1]!.assistantResponseMessage!.toolUses[0]!.input.items.push("hook");
+      request.conversationState.currentMessage.userInputMessage.userInputMessageContext.tools[0]!.toolSpecification.inputSchema.json.properties.value.type = "number";
+    },
+  }).result();
+  expect(result.stopReason).toBe("stop");
+  expect(sent?.conversationState.history[1]?.assistantResponseMessage?.toolUses[0]?.input.items).toEqual(["original", "hook"]);
+  expect(context).toEqual(snapshot);
+});

@@ -2,6 +2,7 @@ import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
+import { isPiRuntimePackage } from "./verify-pi-graph.ts";
 
 type PackageManifest = {
   name: string;
@@ -111,14 +112,14 @@ function exactVersion(name: string, version: string | undefined): string {
 }
 
 function matrixPiDependencies(pkg: PackageManifest, expected: Record<string, string>): Record<string, string> {
-  const peers = Object.keys(pkg.peerDependencies ?? {}).filter((name) => name.startsWith("@earendil-works/pi-"));
+  const peers = Object.keys(pkg.peerDependencies ?? {}).filter(isPiRuntimePackage);
   for (const name of peers) exactVersion(name, expected[name]);
   return Object.fromEntries(Object.entries(expected).map(([name, version]) => [name, exactVersion(name, version)]));
 }
 
 function nonPiRuntimePeers(pkg: PackageManifest): Record<string, string> {
   return Object.fromEntries(Object.keys(pkg.peerDependencies ?? {})
-    .filter((name) => !name.startsWith("@earendil-works/pi-"))
+    .filter((name) => !isPiRuntimePackage(name))
     .map((name) => [name, exactVersion(name, pkg.devDependencies?.[name])]));
 }
 
