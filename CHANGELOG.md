@@ -1,5 +1,9 @@
 # Changelog
 
+## v20261004-1
+
+- Synchronize exact Pi host development dependencies, lockfile, and baseline CI graph to `1.0.2`; provider dispatch, authentication, and transcript contracts are unchanged.
+
 ## v20261001-1
 
 - Target Pi 0.99.2 with exact host development dependencies and a synchronized
