@@ -69,10 +69,10 @@ Push and pull-request CI runs `bun run ci`, `bun pm pack --dry-run`, and a provi
 
 | Lane | Bun | Pi development graph | Install |
 | --- | --- | --- | --- |
-| locked baseline | 1.3.14 (`packageManager`) | `pi-ai` and `pi-coding-agent` exact 1.0.2 lockfile graph | `bun install --frozen-lockfile` |
+| locked baseline | 1.3.14 (`packageManager`) | `pi-ai` and `pi-coding-agent` exact 1.1.0 lockfile graph | `bun install --frozen-lockfile` |
 | older transcript compatibility | 1.4.2 | complete exact 0.87.1 runtime graph in an ephemeral install | `bun install --no-save` |
 
-The 1.0.2 expected runtime map contains `chord`, `pi-agent-core`, `pi-ai`,
+The 1.1.0 expected runtime map contains `chord`, `pi-agent-core`, `pi-ai`,
 `pi-codemode`, `pi-coding-agent`, `pi-mcp`, `pi-telemetry`, and `pi-tui`, all
 under `@earendil-works`. The 0.87.1 map has the same packages except codemode
 and MCP, which are not runtime dependencies in that version. Neither lane has
@@ -90,7 +90,7 @@ minimal-peer-install proof.
 0.85.1 is no longer supported because it lacks `getCurrentSystemPrompt` and
 `getCurrentTools`. 0.87.1 supplies the transcript helpers but predates the
 host's `onProviderStreamEvent` callback. A private stream-options type mirrors
-that optional 1.0.2 contract; there is no runtime version detection, fallback
+that optional 1.1.0 contract; there is no runtime version detection, fallback
 implementation, or compatibility shim. Wildcard host peers follow Pi package
 conventions, not an unrestricted support promise.
 
