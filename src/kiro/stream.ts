@@ -110,9 +110,14 @@ function isCapacityError(body: string): boolean {
   return body.includes(CAPACITY_PATTERN);
 }
 
-function firstTokenTimeoutForModel(modelId: string): number {
-  const m = kiroModels.find((x) => x.id === modelId) as KiroModel | undefined;
-  return m?.firstTokenTimeout ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
+function firstTokenTimeoutForModel(model: Model<Api>): number {
+  const override = (model as KiroModel).firstTokenTimeout;
+  // Larger delays overflow native timers and can become an immediate timeout.
+  if (typeof override === "number" && Number.isFinite(override) && override > 0 && override <= 2_147_483_647) {
+    return override;
+  }
+  const catalogModel = kiroModels.find((entry) => entry.id === model.id);
+  return catalogModel?.firstTokenTimeout ?? FIRST_TOKEN_TIMEOUT_DEFAULT_MS;
 }
 
 class FirstEventDeadlineExceeded extends Error {
@@ -607,7 +612,7 @@ export function streamKiro(
           // Start this before fetch: waiting for response headers and a
           // bounded non-OK body are part of time-to-first-event too.
           firstEventStartedAt = Date.now();
-          firstEventDeadline = createFirstEventDeadline(firstTokenTimeoutForModel(model.id), options?.signal);
+          firstEventDeadline = createFirstEventDeadline(firstTokenTimeoutForModel(model), options?.signal);
 
           log.debug("request.send", {
             attempt: retryCount,

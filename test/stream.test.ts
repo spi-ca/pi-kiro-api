@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import type { Message, Model } from "@earendil-works/pi-ai";
 import { log } from "../src/kiro/debug.ts";
+import type { KiroModel } from "../src/kiro/models.ts";
 import { streamKiro } from "../src/kiro/stream.ts";
 
 const MODEL: Model<"kiro-api"> = {
@@ -112,29 +113,54 @@ test("a retried stream emits one start and one terminal done event", async () =>
   }
 });
 
-test("times out stalled fetches before headers and clears deadline timers", async () => {
+test("honors first-token overrides and fallback bounds before headers, then clears deadlines", async () => {
   const originalFetch = globalThis.fetch;
-  let fetchCalls = 0;
-  globalThis.fetch = (async () => {
-    fetchCalls++;
-    if (fetchCalls === 1) return new Promise<Response>(() => {});
-    return new Response('{"content":"after headers"}{"contextUsagePercentage":1}', { status: 200 });
-  }) as unknown as typeof fetch;
+  const cases = [
+    { id: MODEL.id, timeout: undefined, expected: 90_000 },
+    { id: "standalone-unknown", timeout: undefined, expected: 90_000 },
+    { id: MODEL.id, timeout: 250, expected: 250 },
+    { id: "standalone-unknown", timeout: 500, expected: 500 },
+    { id: "claude-opus-4-7", timeout: 300, expected: 300 },
+    { id: "claude-opus-4-7", timeout: undefined, expected: 180_000 },
+    { id: "standalone-unknown", timeout: 1, expected: 1 },
+    { id: MODEL.id, timeout: 2_147_483_647, expected: 2_147_483_647 },
+    ...[0, -1, NaN, Infinity, -Infinity, 2_147_483_648, "500"].flatMap((timeout) => [
+      { id: "claude-opus-4-7", timeout, expected: 180_000 },
+      { id: "standalone-unknown", timeout, expected: 90_000 },
+    ]),
+  ];
 
   try {
-    const events = await withFakeClock(async (clock) => {
-      const eventsPromise = collectEvents(streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key" }));
-      await flushMicrotasks();
-      clock.advance(90_000);
-      await flushMicrotasks();
-      clock.advance(1_000);
-      const result = await eventsPromise;
-      expect(clock.pending()).toBe(0);
-      return result;
-    });
-
-    expect(fetchCalls).toBe(2);
-    expect(events.at(-1)?.type).toBe("done");
+    for (const { id, timeout, expected } of cases) {
+      let fetchCalls = 0;
+      let firstSignal: AbortSignal | undefined;
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        fetchCalls++;
+        if (fetchCalls === 1) {
+          firstSignal = init?.signal ?? undefined;
+          return new Promise<Response>(() => {});
+        }
+        return new Response('{"content":"after headers"}{"contextUsagePercentage":1}', { status: 200 });
+      }) as unknown as typeof fetch;
+      const model = { ...MODEL, id, firstTokenTimeout: timeout } as KiroModel;
+      const events = await withFakeClock(async (clock) => {
+        const eventsPromise = collectEvents(streamKiro(model, { messages: [], tools: [] }, { apiKey: "test-key" }));
+        await flushMicrotasks();
+        expect(fetchCalls).toBe(1);
+        clock.advance(expected - 1);
+        await flushMicrotasks();
+        expect(firstSignal?.aborted).toBe(false);
+        clock.advance(1);
+        await flushMicrotasks();
+        expect(firstSignal?.aborted).toBe(true);
+        clock.advance(1_000);
+        const result = await eventsPromise;
+        expect(clock.pending()).toBe(0);
+        return result;
+      });
+      expect(fetchCalls).toBe(2);
+      expect(events.at(-1)?.type).toBe("done");
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -255,12 +281,20 @@ test("preserves caller aborts during a stalled pre-header request", async () => 
   }) as unknown as typeof fetch;
 
   try {
-    const eventsPromise = collectEvents(
-      streamKiro(MODEL, { messages: [], tools: [] }, { apiKey: "test-key", signal: controller.signal }),
-    );
-    await flushMicrotasks();
-    controller.abort(new Error("caller stopped request"));
-    const events = await eventsPromise;
+    const events = await withFakeClock(async (clock) => {
+      const model = { ...MODEL, id: "standalone-unknown", firstTokenTimeout: 500 } as KiroModel;
+      const eventsPromise = collectEvents(
+        streamKiro(model, { messages: [], tools: [] }, { apiKey: "test-key", signal: controller.signal }),
+      );
+      await flushMicrotasks();
+      clock.advance(499);
+      controller.abort(new Error("caller stopped request"));
+      const result = await eventsPromise;
+      expect(clock.pending()).toBe(0);
+      clock.advance(10_000);
+      expect(clock.pending()).toBe(0);
+      return result;
+    });
 
     expect(fetchCalls).toBe(1);
     expect(events.at(-1)).toEqual(expect.objectContaining({ type: "error", reason: "aborted" }));

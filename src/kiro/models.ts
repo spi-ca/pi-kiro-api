@@ -43,7 +43,7 @@ export type KiroModel = Model<"kiro-api"> & {
    * reconstructing arbitrary IDs from Pi's public dashed form.
    */
   wireModelId?: string;
-  /** Optional per-model override for the first-token timeout (ms). */
+  /** Optional first-token timeout in ms: finite, positive, at most 2^31 - 1 (native timer limit). */
   firstTokenTimeout?: number;
   /**
    * Upstream hides reasoning from clients — no `<thinking>` tags, no native
