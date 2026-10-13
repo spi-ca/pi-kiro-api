@@ -1,5 +1,10 @@
 # Changelog
 
+## v20261013-1
+
+- Update Pi development dependencies, lockfile, and the current CI graph to exact `1.2.0`; remove `chord` from the current graph while preserving the older regression lane.
+- Keep provider authentication, validated per-model timeouts, transcript handling, and cancellation contracts unchanged. Live Kiro acceptance remains separate from offline CI.
+
 ## v20261009-1
 
 - Updated the Pi development dependencies, lockfile, and current CI graph to exact `1.1.0`; provider authentication and transcript contracts are unchanged.
