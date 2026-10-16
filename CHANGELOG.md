@@ -1,5 +1,9 @@
 # Changelog
 
+## v20261016-1
+
+- Update Pi development dependencies, lockfile, and the baseline CI graph to exact `1.3.0`. Preserve wildcard peers, provider authentication, historical thinking removal, strict final tool-JSON parsing, and the older regression lane.
+
 ## v20261013-1
 
 - Update Pi development dependencies, lockfile, and the current CI graph to exact `1.2.0`; remove `chord` from the current graph while preserving the older regression lane.

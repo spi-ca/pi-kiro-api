@@ -69,10 +69,10 @@ Push and pull-request CI runs `bun run ci`, `bun pm pack --dry-run`, and a provi
 
 | Lane | Bun | Pi development graph | Install |
 | --- | --- | --- | --- |
-| locked baseline | 1.3.14 (`packageManager`) | `pi-ai` and `pi-coding-agent` exact 1.2.0 lockfile graph | `bun install --frozen-lockfile` |
+| locked baseline | 1.3.14 (`packageManager`) | `pi-ai` and `pi-coding-agent` exact 1.3.0 lockfile graph | `bun install --frozen-lockfile` |
 | older transcript compatibility | 1.4.2 | complete exact 0.87.1 runtime graph in an ephemeral install | `bun install --no-save` |
 
-The 1.2.0 expected runtime map contains `pi-agent-core`, `pi-ai`,
+The 1.3.0 expected runtime map contains `pi-agent-core`, `pi-ai`,
 `pi-codemode`, `pi-coding-agent`, `pi-mcp`, `pi-telemetry`, and `pi-tui`, all
 under `@earendil-works`. The 0.87.1 map additionally contains `chord`, but excludes codemode
 and MCP, which are not runtime dependencies in that version. Neither lane has
