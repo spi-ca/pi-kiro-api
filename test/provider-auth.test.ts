@@ -57,8 +57,88 @@ describe("Kiro native provider authentication", () => {
   test("uses the default region and rejects unsafe region values", () => {
     expect(resolveKiroRegion(undefined)).toBe(DEFAULT_KIRO_REGION);
     expect(resolveKiroRegion("  eu-central-1  ")).toBe("eu-central-1");
-    expect(() => resolveKiroRegion("https://example.test")).toThrow("Invalid Kiro API region");
-    expect(() => resolveKiroRegion("us_east_1")).toThrow("Invalid Kiro API region");
+    for (const value of [
+      "https://example.test",
+      "us_east_1",
+      "ksk_accidentally-pasted-secret",
+      "us-east-1\n\u001b[31mforged notice",
+      "a".repeat(64),
+    ]) {
+      expect(() => resolveKiroRegion(value)).toThrow(
+        "Kiro API region is invalid. Use an AWS region such as us-east-1.",
+      );
+      try {
+        resolveKiroRegion(value);
+      } catch (error) {
+        expect((error as Error).message).not.toContain(value);
+      }
+    }
+  });
+
+  test("uses consistent native provider and API-key method labels", () => {
+    const provider = createKiroProvider();
+    expect(provider.id).toBe("kiro-api-key");
+    expect(provider.name).toBe("Kiro (API key)");
+    expect(provider.auth.apiKey?.name).toBe("Kiro API key");
+  });
+
+  test("blank login key gives bootstrap guidance without starting discovery", async () => {
+    let fetchCalls = 0;
+    await withMockFetch(
+      async () => {
+        fetchCalls++;
+        throw new Error("blank keys must not reach discovery");
+      },
+      async () => {
+        const provider = createKiroProvider();
+        await expect(provider.auth.apiKey?.login?.({
+          signal: new AbortController().signal,
+          notify: () => {},
+          prompt: async () => "   ",
+        })).rejects.toThrow(
+          "Kiro API key is required. Run /login kiro-api-key or set KIRO_API_KEY before starting Pi.",
+        );
+        expect(provider.getModels()).toEqual([]);
+      },
+    );
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("rejected-key auth errors keep safe diagnostics before recovery guidance", async () => {
+    for (const status of [401, 403]) {
+      await withMockFetch(
+        async () => new Response(JSON.stringify({
+          code: "AccessDeniedException",
+          reason: "INVALID_KEY",
+          message: "private account details",
+          errorMessage: "ksk_private-service-body",
+        }), { status }),
+        async () => {
+          const provider = createKiroProvider();
+          const answers = ["ksk_login-key", "eu-central-1"];
+          const expected = `Kiro API key was rejected. Kiro model discovery failed: HTTP ${status} (code=AccessDeniedException, reason=INVALID_KEY). Run /login kiro-api-key or check KIRO_API_KEY.`;
+          const operations = [
+            () => provider.auth.apiKey?.login?.({
+              signal: new AbortController().signal,
+              notify: () => {},
+              prompt: async () => answers.shift() ?? "",
+            }),
+            () => provider.refreshModels?.(refreshContext()),
+          ];
+          for (const operation of operations) {
+            let caught: unknown;
+            try {
+              await operation();
+            } catch (error) {
+              caught = error;
+            }
+            expect(caught).toBeInstanceOf(Error);
+            expect((caught as Error).message).toBe(expected);
+          }
+          expect(provider.getModels()).toEqual([]);
+        },
+      );
+    }
   });
 
   test("uses Pi's native ApiKeyCredential/AuthResult resolution precedence", async () => {
@@ -84,11 +164,24 @@ describe("Kiro native provider authentication", () => {
       async () => {
         const provider = createKiroProvider();
         const answers = ["ksk_login-key", "eu-central-1"];
-        await provider.auth.apiKey?.login?.({
+        const prompts: unknown[] = [];
+        const result = await provider.auth.apiKey?.login?.({
           signal: new AbortController().signal,
           notify: () => {},
-          prompt: async () => answers.shift() ?? "",
+          prompt: async (prompt) => {
+            prompts.push(prompt);
+            return answers.shift() ?? "";
+          },
         });
+        expect(prompts).toEqual([
+          { type: "secret", message: "Kiro API key" },
+          {
+            type: "text",
+            message: "Kiro API region (default: us-east-1)",
+            placeholder: "us-east-1",
+          },
+        ]);
+        expect(result).toEqual(credential("ksk_login-key", "eu-central-1"));
         expect(provider.getModels()).toHaveLength(2); // Kiro's derived -1m companion is included.
         expect(provider.getModels().every((model) => model.provider === KIRO_PROVIDER_ID)).toBe(true);
       },
