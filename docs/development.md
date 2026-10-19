@@ -2,7 +2,9 @@
 
 ## Setup
 
-Use the Bun version declared in `package.json`.
+Use the latest stable Bun release, with **Bun >=1.4.2** as the supported
+minimum declared by `engines.bun` in `package.json`. The runtime is not pinned
+to one Bun patch version.
 
 ```bash
 bun install --frozen-lockfile
@@ -65,12 +67,12 @@ acceptance is intentionally outside CI and routine verification scope.
 
 ## Automatic CI compatibility matrix
 
-Push and pull-request CI runs `bun run ci`, `bun pm pack --dry-run`, and a provider-free tarball smoke; it passes no provider credentials and does not invoke Kiro/network acceptance. The smoke installs the tarball with lifecycle scripts disabled in an isolated temporary consumer, adds exact Pi runtime peers, imports it, and invokes only a registration stub with `KIRO_API_KEY` removed and `PI_OFFLINE=1`. Each lane logs the selected Bun version and the available `cc` compiler.
+Push and pull-request CI runs `bun run ci`, `bun pm pack --dry-run`, and a provider-free tarball smoke; it passes no provider credentials and does not invoke Kiro/network acceptance. The smoke installs the tarball with lifecycle scripts disabled in an isolated temporary consumer, adds exact Pi runtime peers, imports it, and invokes only a registration stub with `KIRO_API_KEY` removed and `PI_OFFLINE=1`. Both lanes use the latest stable Bun release via `setup-bun`'s `bun-version: latest`. Each lane checks the installed version against the action's resolved `bun-version` output, enforces Bun >=1.4.2, and logs the selected Bun version and the available `cc` compiler.
 
 | Lane | Bun | Pi development graph | Install |
 | --- | --- | --- | --- |
-| locked baseline | 1.3.14 (`packageManager`) | `pi-ai` and `pi-coding-agent` exact 1.3.0 lockfile graph | `bun install --frozen-lockfile` |
-| older transcript compatibility | 1.4.2 | complete exact 0.87.1 runtime graph in an ephemeral install | `bun install --no-save` |
+| locked baseline | latest stable (>=1.4.2) | `pi-ai` and `pi-coding-agent` exact 1.3.0 lockfile graph | `bun install --frozen-lockfile` |
+| older transcript compatibility | latest stable (>=1.4.2) | complete exact 0.87.1 runtime graph in an ephemeral install | `bun install --no-save` |
 
 The 1.3.0 expected runtime map contains `pi-agent-core`, `pi-ai`,
 `pi-codemode`, `pi-coding-agent`, `pi-mcp`, `pi-telemetry`, and `pi-tui`, all
@@ -107,6 +109,5 @@ PI_OFFLINE=1 bun .github/scripts/package-smoke.ts
 
 The smoke helper isolates HOME/cache/environment and omits credentials.
 Package-registry access is needed to install the smoke consumer; no Kiro
-service call is made. Local migration verification used Bun 1.4.2, not the
-hosted baseline's Bun 1.3.14. Hosted CI itself and live Kiro acceptance were
-not run locally.
+service call is made. Local migration verification used Bun 1.4.2. Hosted CI
+itself and live Kiro acceptance were not run locally.

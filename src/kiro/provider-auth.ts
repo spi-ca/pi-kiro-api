@@ -50,7 +50,7 @@ export function resolveKiroRegion(value: string | undefined): string {
   const region = nonEmpty(value) ?? DEFAULT_KIRO_REGION;
   if (!REGION_PATTERN.test(region) || region.length > 63) {
     throw new Error(
-      `Invalid Kiro API region "${region}". Use an AWS region such as ${DEFAULT_KIRO_REGION}.`,
+      `Kiro API region is invalid. Use an AWS region such as ${DEFAULT_KIRO_REGION}.`,
     );
   }
   return region;
@@ -64,7 +64,7 @@ function rejectedKeyError(error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);
   if (/HTTP (?:401|403)\b/.test(message)) {
     return new Error(
-      "Kiro API key was rejected. Run /login kiro-api-key or check KIRO_API_KEY. " + message,
+      `Kiro API key was rejected. ${message}. Run /login kiro-api-key or check KIRO_API_KEY.`,
     );
   }
   return error instanceof Error ? error : new Error(message);
@@ -378,7 +378,7 @@ export function createKiroProvider(): KiroProvider {
 
   const provider: KiroProvider = {
     id: KIRO_PROVIDER_ID,
-    name: "Kiro (API Key)",
+    name: "Kiro (API key)",
     baseUrl: kiroBaseUrl(DEFAULT_KIRO_REGION),
     auth: {
       apiKey: {
@@ -388,7 +388,9 @@ export function createKiroProvider(): KiroProvider {
             await interaction.prompt({ type: "secret", message: "Kiro API key" }),
           );
           if (!key) {
-            throw new Error("Kiro API key is required. Run /login kiro-api-key or set KIRO_API_KEY.");
+            throw new Error(
+              "Kiro API key is required. Run /login kiro-api-key or set KIRO_API_KEY before starting Pi.",
+            );
           }
           const region = resolveKiroRegion(
             await interaction.prompt({

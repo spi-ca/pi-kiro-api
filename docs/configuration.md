@@ -25,6 +25,15 @@ Pi stores provider credentials in its auth store (normally
 includes the API key and its `KIRO_API_REGION`; run `/login kiro-api-key` again
 to replace either value.
 
+### Authentication display and errors
+
+This extension uses Pi's native authentication UI, without a separate settings
+screen or status widget. `/login` lists `Kiro (API key)` and uses secret input
+for the key. Invalid-region errors show an AWS region example without echoing
+the supplied value. Rejected-key errors show the status and sanitized service
+diagnostics before recovery guidance. For environment-based authentication,
+set `KIRO_API_KEY` **before** starting Pi.
+
 ## Headless environments
 
 Set environment variables before Pi starts:

@@ -42,7 +42,7 @@ test("extension registers a native provider when no ambient key is configured", 
     expect(providers[0]).toEqual(
       expect.objectContaining({
         id: KIRO_PROVIDER_ID,
-        name: "Kiro (API Key)",
+        name: "Kiro (API key)",
         baseUrl: "https://q.us-east-1.amazonaws.com/",
         auth: expect.objectContaining({ apiKey: expect.any(Object) }),
         getModels: expect.any(Function),
