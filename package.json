@@ -16,7 +16,9 @@
     ]
   },
   "main": "./extension.ts",
-  "packageManager": "bun@1.3.14",
+  "engines": {
+    "bun": ">=1.4.2"
+  },
   "scripts": {
     "test": "bun test",
     "check": "bunx tsc --noEmit",
