@@ -71,10 +71,10 @@ Push and pull-request CI runs `bun run ci`, `bun pm pack --dry-run`, and a provi
 
 | Lane | Bun | Pi development graph | Install |
 | --- | --- | --- | --- |
-| locked baseline | latest stable (>=1.4.2) | `pi-ai` and `pi-coding-agent` exact 1.3.0 lockfile graph | `bun install --frozen-lockfile` |
+| locked baseline | latest stable (>=1.4.2) | `pi-ai` and `pi-coding-agent` exact 1.4.0 lockfile graph | `bun install --frozen-lockfile` |
 | older transcript compatibility | latest stable (>=1.4.2) | complete exact 0.87.1 runtime graph in an ephemeral install | `bun install --no-save` |
 
-The 1.3.0 expected runtime map contains `pi-agent-core`, `pi-ai`,
+The 1.4.0 expected runtime map contains `pi-agent-core`, `pi-ai`,
 `pi-codemode`, `pi-coding-agent`, `pi-mcp`, `pi-telemetry`, and `pi-tui`, all
 under `@earendil-works`. The 0.87.1 map additionally contains `chord`, but excludes codemode
 and MCP, which are not runtime dependencies in that version. Neither lane has
@@ -109,5 +109,22 @@ PI_OFFLINE=1 bun .github/scripts/package-smoke.ts
 
 The smoke helper isolates HOME/cache/environment and omits credentials.
 Package-registry access is needed to install the smoke consumer; no Kiro
-service call is made. Local migration verification used Bun 1.4.2. Hosted CI
-itself and live Kiro acceptance were not run locally.
+service call is made. Local Pi 1.4.0 migration verification used Bun 1.4.3.
+Hosted CI itself and live Kiro acceptance were not run locally.
+
+## Pi 1.4.0 compatibility review
+
+No Kiro runtime changes are needed for this upgrade:
+
+- Attribution-header changes apply to Pi's built-in provider adapters. Kiro
+  discovery and streaming retain their own AWS/Kiro headers and user agent;
+  the extension does not register a `before_provider_headers` handler.
+- The loader now aliases `@earendil-works/pi-ai/models`. Kiro's thinking
+  helpers already import from the supported `pi-ai` root, so no import shim
+  or legacy-lane change is needed.
+- Pi's automatic-retry classifier changes remain host-owned. Kiro retains its
+  bounded transport retries, sanitized errors, cancellation, and prohibition
+  on internal replay after visible provider output.
+- Pi's compaction and branch summaries no longer pass a fixed `maxTokens`
+  cap. Kiro neither calls those summary helpers nor serializes an output-token
+  cap into its wire request, so removing the host cap needs no provider change.

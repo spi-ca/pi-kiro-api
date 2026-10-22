@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Update Pi development dependencies, lockfile, and the complete baseline CI graph to exact `1.4.0`; retain the `0.87.1` transcript compatibility lane and wildcard host peers.
+- Review Pi 1.4.0 attribution headers, model-loader aliases, automatic retries, and summary output limits. No Kiro runtime adaptation is required; provider-owned authentication, request headers, retry policy, and transcript handling remain unchanged. Verification remains provider-free, not live Kiro acceptance.
+
 ## v20261016-1
 
 - Update Pi development dependencies, lockfile, and the baseline CI graph to exact `1.3.0`. Preserve wildcard peers, provider authentication, historical thinking removal, strict final tool-JSON parsing, and the older regression lane.
