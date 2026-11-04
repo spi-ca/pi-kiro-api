@@ -169,7 +169,7 @@ active. Incoming transcript messages are not modified.
 
 The standalone exported `streamKiro` also accepts the shorthand `Context` form
 and normalizes it at its public boundary. This is not an older-Pi runtime shim;
-the required replay helpers must exist in the host (tested: 0.99.2 and 0.87.1).
+the required replay helpers must exist in the host (current CI lanes: 1.5.0 and 0.87.1).
 
 ## Thinking levels
 
@@ -254,6 +254,12 @@ The parser accepts a `usage` frame carrying `inputTokens`/`outputTokens`, and
 when one arrives it takes precedence over both approximations. Treat that as
 an opportunistic path rather than the norm: the API-key stream has not been
 observed to emit it, so in practice both values are estimates.
+
+Pi 1.5.0's `calculateCost` sets the optional `usage.cost.totalFromProvider` to
+`false` (older hosts omit it): even reported token counts do not establish a
+billed currency total. The optional `responseModel` remains unset because this
+stream does not report a concrete response-model ID; `model` retains the
+requested model ID.
 
 The real charge arrives as a `meteringEvent` credit amount, which has no
 representation in pi's `Usage` type: every field there is tokens or currency,

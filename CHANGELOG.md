@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## [0.4.1]
 
-- Update Pi development dependencies, lockfile, and the complete baseline CI graph to exact `1.4.0`; retain the `0.87.1` transcript compatibility lane and wildcard host peers.
-- Review Pi 1.4.0 attribution headers, model-loader aliases, automatic retries, and summary output limits. No Kiro runtime adaptation is required; provider-owned authentication, request headers, retry policy, and transcript handling remain unchanged. Verification remains provider-free, not live Kiro acceptance.
+- Update Pi development dependencies, lockfile, and the complete baseline CI graph to exact `1.5.0`, including the new `pi-schema` runtime dependency; retain the `0.87.1` transcript compatibility lane and wildcard host peers.
+- Use a version-matched changelog heading so Pi 1.5.0 can show these extension update notes after the package version increases. Preserve the dated release history below.
+- Review Pi 1.5.0 schema validation, incremental tool parsing, response-model metadata, and provider-reported billing totals. Keep strict final tool-JSON parsing and leave `responseModel` unset. Do not claim provider-reported billing: Pi 1.5.0's `calculateCost` marks `usage.cost.totalFromProvider` false. Requested model IDs and token counts are not evidence of a concrete response model or billed currency.
+- Retain the Pi 1.4.0 review of attribution headers, model-loader aliases, automatic retries, and summary output limits. No Kiro runtime adaptation is required; provider-owned authentication, request headers, retry policy, and transcript handling remain unchanged. Verification remains provider-free, not live Kiro acceptance.
 
 ## v20261016-1
 
