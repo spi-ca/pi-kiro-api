@@ -71,16 +71,19 @@ Push and pull-request CI runs `bun run ci`, `bun pm pack --dry-run`, and a provi
 
 | Lane | Bun | Pi development graph | Install |
 | --- | --- | --- | --- |
-| locked baseline | latest stable (>=1.4.2) | `pi-ai` and `pi-coding-agent` exact 1.4.0 lockfile graph | `bun install --frozen-lockfile` |
+| locked baseline | latest stable (>=1.4.2) | `pi-ai` and `pi-coding-agent` exact 1.5.0 lockfile graph | `bun install --frozen-lockfile` |
 | older transcript compatibility | latest stable (>=1.4.2) | complete exact 0.87.1 runtime graph in an ephemeral install | `bun install --no-save` |
 
-The 1.4.0 expected runtime map contains `pi-agent-core`, `pi-ai`,
-`pi-codemode`, `pi-coding-agent`, `pi-mcp`, `pi-telemetry`, and `pi-tui`, all
-under `@earendil-works`. The 0.87.1 map additionally contains `chord`, but excludes codemode
-and MCP, which are not runtime dependencies in that version. Neither lane has
-obsolete `pi-client`/`pi-protocol` runtime dependencies. The recursive verifier
+The 1.5.0 expected runtime map contains `pi-agent-core`, `pi-ai`,
+`pi-codemode`, `pi-coding-agent`, `pi-mcp`, `pi-schema`, `pi-telemetry`, and
+`pi-tui`, all under `@earendil-works` at exact 1.5.0. `pi-schema` is a new
+transitive runtime dependency of `pi-ai` and `pi-agent-core`; omitting it from
+the expected map fails verification. The 0.87.1 map contains `chord`, but excludes
+codemode, MCP, and schema, which are not runtime dependencies in that version.
+Neither lane has obsolete `pi-client`/`pi-protocol` runtime dependencies. The recursive verifier
 checks scoped packages, nested `node_modules`, and cyclic Bun store symlinks;
-its self-test also rejects missing, unexpected, and mismatched `chord`.
+its self-test also rejects missing, unexpected, and mismatched `chord` and
+`pi-schema` (including a second nested schema version).
 
 Every expected package must be present at exactly the selected version.
 The compatibility lane temporarily pins the entire runtime map, then restores
@@ -109,12 +112,56 @@ PI_OFFLINE=1 bun .github/scripts/package-smoke.ts
 
 The smoke helper isolates HOME/cache/environment and omits credentials.
 Package-registry access is needed to install the smoke consumer; no Kiro
-service call is made. Local Pi 1.4.0 migration verification used Bun 1.4.3.
-Hosted CI itself and live Kiro acceptance were not run locally.
+service call is made. Keep local Bun cache and temporary artifacts inside the
+worktree when verifying:
 
-## Pi 1.4.0 compatibility review
+```bash
+mkdir -p .bun-tmp/cache .bun-tmp/tmp
+export BUN_INSTALL_CACHE_DIR="$PWD/.bun-tmp/cache"
+export TMPDIR="$PWD/.bun-tmp/tmp"
+```
+
+`PI_OFFLINE=1` disables Pi discovery, not Bun's package-registry access during
+installation. Run provider-free checks without credentials. Local migration
+verification with Bun 1.4.4 passed `bun run ci` (144 tests), recursive graph
+checks, assertion-helper self-tests, existing registration, pack inspection,
+and provider-free tarball registration in both lanes. The older lane used an
+isolated copy inside `.bun-tmp` without changing the baseline manifest or
+lockfile. Hosted CI and live Kiro acceptance were not run.
+
+## Pi 1.5.0 compatibility review
 
 No Kiro runtime changes are needed for this upgrade:
+
+- Tool validation now uses `pi-schema`, and `pi-ai` no longer re-exports
+  TypeBox from its main entry. This provider imports neither TypeBox nor
+  TypeBox-only validators; it forwards JSON tool schemas and preserves strict
+  final object-JSON parsing. Host validation/coercion and its new error messages
+  remain host-owned. No schema dependency or compatibility shim is added to
+  the extension's runtime manifest.
+- Pi's incremental tool-argument parsing does not require changing this
+  provider's stream contract. Kiro tool fragments are accumulated and parsed
+  once at finalization; malformed or non-object final arguments still fail
+  instead of executing partially parsed input.
+- `AssistantMessage.responseModel` is optional and remains unset: the current
+  parsed Kiro stream does not expose a concrete response-model ID. The requested
+  ID in `model` is not evidence of one.
+- `Usage.cost.totalFromProvider` is optional. Pi 1.5.0's existing `calculateCost`
+  helper now sets it to `false`; older hosts omit it. Usage token counts
+  (reported or estimated) are not billed currency totals; Kiro credits are not
+  USD. Mocked regressions cover both usage paths without claiming provider
+  billing metadata.
+- Pi's native extension-update notices read the root `CHANGELOG.md` by default.
+  Version 0.4.1 and its matching `## [0.4.1]` heading allow the next fresh launch
+  after an update to show these notes. First discovery records the version
+  without a notice; `/changelog` does not show extension package changelogs.
+- Authentication, discovery, instrumentation hooks, cancellation, bounded
+  transport retries, and no replay after visible output remain unchanged.
+  Provider-free tests are not live Kiro acceptance.
+
+## Prior Pi 1.4.0 compatibility review
+
+These earlier compatibility conclusions still apply:
 
 - Attribution-header changes apply to Pi's built-in provider adapters. Kiro
   discovery and streaming retain their own AWS/Kiro headers and user agent;

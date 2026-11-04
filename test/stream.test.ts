@@ -1495,6 +1495,29 @@ test("observes parsed events in order before normalizing each block", async () =
   ]);
 });
 
+test("token usage does not fabricate provider billing or a concrete response model", async () => {
+  for (const reported of [false, true]) {
+    const body = '{"content":"answer"}{"contextUsagePercentage":1}' +
+      (reported ? '{"usage":{"inputTokens":7,"outputTokens":3}}' : "");
+    const response = streamKiro(MODEL, { messages: [] }, {
+      apiKey: "test-key",
+      fetch: (async () => new Response(body)) as unknown as typeof fetch,
+    });
+    const events = await collectEvents(response);
+    expect(events.filter((event) => event.type === "start")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "done")).toHaveLength(1);
+    const result = await response.result();
+    expect(result.model).toBe(MODEL.id);
+    expect(result).not.toHaveProperty("responseModel");
+    expect(result.usage.input).toBe(reported ? 7 : 2_000);
+    expect(result.usage.output).toBe(reported ? 3 : 2);
+    expect(result.usage.totalTokens).toBe(result.usage.input + result.usage.output);
+    expect(result.usage.cost).toEqual(expect.objectContaining({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }));
+    // Pi 1.5 calculateCost marks estimates false; older hosts omit the flag.
+    expect(result.usage.cost).not.toHaveProperty("totalFromProvider", true);
+  }
+});
+
 test("callback rejections terminate once, cancel bodies, and never retry", async () => {
   for (const phase of ["onPayload", "onResponse", "onProviderStreamEvent"] as const) {
     await withFakeClock(async (clock) => {

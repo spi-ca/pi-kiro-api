@@ -132,7 +132,19 @@ function selfTest(): void {
     expectFailure(() => verifyPiGraph(nodeModules, withoutChord, []), "an unexpected chord dependency");
     rmSync(chord, { recursive: true });
     expectFailure(() => verifyPiGraph(nodeModules, expected, []), "a missing chord dependency");
-    console.log("synthetic scoped/cyclic Bun graph and mismatched/unexpected/missing chord verified");
+
+    // Pi 1.5 adds pi-schema: the old seven-package map must not silently pass.
+    const schema = join(nodeModules, "@earendil-works/pi-schema");
+    writePackage(schema, "@earendil-works/pi-schema", "1.2.3");
+    expectFailure(() => verifyPiGraph(nodeModules, withoutChord, []), "an unexpected pi-schema dependency");
+    const withSchema = { ...withoutChord, "@earendil-works/pi-schema": "1.2.3" };
+    verifyPiGraph(nodeModules, withSchema, []);
+    writePackage(join(nodeModules, "some-package/node_modules/@earendil-works/pi-schema"), "@earendil-works/pi-schema", "9.9.9");
+    expectFailure(() => verifyPiGraph(nodeModules, withSchema, []), "a second mismatched pi-schema version");
+    rmSync(join(nodeModules, "some-package"), { recursive: true });
+    rmSync(schema, { recursive: true });
+    expectFailure(() => verifyPiGraph(nodeModules, withSchema, []), "a missing pi-schema dependency");
+    console.log("synthetic scoped/cyclic Bun graph and mismatched/unexpected/missing chord and pi-schema verified");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
