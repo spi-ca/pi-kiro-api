@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.1104.2]
+
+- Adopt date-based package versioning for release `v20261104-2`, with a matching changelog heading for Pi's extension-update notices.
+- Preserve the Pi 1.5.0 development graph, wildcard host peers, and prior `0.4.1` release notes. Provider authentication, streaming, and runtime behavior are unchanged.
+
 ## [0.4.1]
 
 - Update Pi development dependencies, lockfile, and the complete baseline CI graph to exact `1.5.0`, including the new `pi-schema` runtime dependency; retain the `0.87.1` transcript compatibility lane and wildcard host peers.

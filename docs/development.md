@@ -152,9 +152,10 @@ No Kiro runtime changes are needed for this upgrade:
   USD. Mocked regressions cover both usage paths without claiming provider
   billing metadata.
 - Pi's native extension-update notices read the root `CHANGELOG.md` by default.
-  Version 0.4.1 and its matching `## [0.4.1]` heading allow the next fresh launch
-  after an update to show these notes. First discovery records the version
-  without a notice; `/changelog` does not show extension package changelogs.
+  Package version `2026.1104.2` (release tag `v20261104-2`) and its matching
+  `## [2026.1104.2]` heading allow the next fresh launch after an update to show
+  these notes. First discovery records the version without a notice;
+  `/changelog` does not show extension package changelogs.
 - Authentication, discovery, instrumentation hooks, cancellation, bounded
   transport retries, and no replay after visible output remain unchanged.
   Provider-free tests are not live Kiro acceptance.
