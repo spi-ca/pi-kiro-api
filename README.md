@@ -1,8 +1,8 @@
 # pi-kiro-api
 
 A [Pi](https://pi.dev) native provider for Kiro API keys, targeting
-Pi **1.5.0**, with an older transcript compatibility lane at
-**0.87.1**. It uses provider-owned
+Pi **1.5.1** as the locked baseline, with CI compatibility lanes for Pi
+**1.6.0** and the older transcript-capable **0.87.1**. It uses provider-owned
 authentication and Kiro's
 `ListAvailableModels` catalog for the active key and AWS region. The streaming
 implementation under `src/kiro/` is vendored from

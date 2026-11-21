@@ -169,7 +169,8 @@ active. Incoming transcript messages are not modified.
 
 The standalone exported `streamKiro` also accepts the shorthand `Context` form
 and normalizes it at its public boundary. This is not an older-Pi runtime shim;
-the required replay helpers must exist in the host (current CI lanes: 1.5.0 and 0.87.1).
+the required replay helpers must exist in the host. See the
+[CI compatibility matrix](development.md#automatic-ci-compatibility-matrix) for tested versions.
 
 ## Thinking levels
 
