@@ -67,26 +67,27 @@ acceptance is intentionally outside CI and routine verification scope.
 
 ## Automatic CI compatibility matrix
 
-Push and pull-request CI runs `bun run ci`, `bun pm pack --dry-run`, and a provider-free tarball smoke; it passes no provider credentials and does not invoke Kiro/network acceptance. The smoke installs the tarball with lifecycle scripts disabled in an isolated temporary consumer, adds exact Pi runtime peers, imports it, and invokes only a registration stub with `KIRO_API_KEY` removed and `PI_OFFLINE=1`. Both lanes use the latest stable Bun release via `setup-bun`'s `bun-version: latest`. Each lane checks the installed version against the action's resolved `bun-version` output, enforces Bun >=1.4.2, and logs the selected Bun version and the available `cc` compiler.
+Push and pull-request CI runs `bun run ci`, `bun pm pack --dry-run`, and a provider-free tarball smoke; it passes no provider credentials and does not invoke Kiro/network acceptance. The smoke installs the tarball with lifecycle scripts disabled in an isolated temporary consumer, adds exact Pi runtime peers, imports it, and invokes only a registration stub with `KIRO_API_KEY` removed and `PI_OFFLINE=1`. All lanes use the latest stable Bun release via `setup-bun`'s `bun-version: latest`. Each lane checks the installed version against the action's resolved `bun-version` output, enforces Bun >=1.4.2, and logs the selected Bun version and the available `cc` compiler.
 
 | Lane | Bun | Pi development graph | Install |
 | --- | --- | --- | --- |
-| locked baseline | latest stable (>=1.4.2) | `pi-ai` and `pi-coding-agent` exact 1.5.0 lockfile graph | `bun install --frozen-lockfile` |
+| locked baseline | latest stable (>=1.4.2) | `pi-ai` and `pi-coding-agent` exact 1.5.1 lockfile graph | `bun install --frozen-lockfile` |
+| Pi 1.6 compatibility | latest stable (>=1.4.2) | complete exact 1.6.0 runtime graph in an ephemeral install | `bun install --no-save` |
 | older transcript compatibility | latest stable (>=1.4.2) | complete exact 0.87.1 runtime graph in an ephemeral install | `bun install --no-save` |
 
-The 1.5.0 expected runtime map contains `pi-agent-core`, `pi-ai`,
+The 1.5.1 and 1.6.0 runtime maps both contain `pi-agent-core`, `pi-ai`,
 `pi-codemode`, `pi-coding-agent`, `pi-mcp`, `pi-schema`, `pi-telemetry`, and
-`pi-tui`, all under `@earendil-works` at exact 1.5.0. `pi-schema` is a new
-transitive runtime dependency of `pi-ai` and `pi-agent-core`; omitting it from
-the expected map fails verification. The 0.87.1 map contains `chord`, but excludes
-codemode, MCP, and schema, which are not runtime dependencies in that version.
-Neither lane has obsolete `pi-client`/`pi-protocol` runtime dependencies. The recursive verifier
+`pi-tui`, all under `@earendil-works` at the lane's exact version. `pi-schema`
+is a transitive runtime dependency of `pi-ai` and `pi-agent-core`; omitting it
+from either expected map fails verification. The 0.87.1 map contains `chord`,
+but excludes codemode, MCP, and schema, which are not runtime dependencies in
+that version. None of the lanes has obsolete `pi-client`/`pi-protocol` runtime dependencies. The recursive verifier
 checks scoped packages, nested `node_modules`, and cyclic Bun store symlinks;
 its self-test also rejects missing, unexpected, and mismatched `chord` and
 `pi-schema` (including a second nested schema version).
 
 Every expected package must be present at exactly the selected version.
-The compatibility lane temporarily pins the entire runtime map, then restores
+Each compatibility lane temporarily pins its entire runtime map, then restores
 the manifest and verifies that neither it nor the lockfile changed. The
 tarball smoke injects that same complete map and declared non-Pi peers in an
 isolated consumer: it is a deterministic compatibility harness, not a
@@ -123,11 +124,12 @@ export TMPDIR="$PWD/.bun-tmp/tmp"
 
 `PI_OFFLINE=1` disables Pi discovery, not Bun's package-registry access during
 installation. Run provider-free checks without credentials. Local migration
-verification with Bun 1.4.4 passed `bun run ci` (144 tests), recursive graph
-checks, assertion-helper self-tests, existing registration, pack inspection,
-and provider-free tarball registration in both lanes. The older lane used an
-isolated copy inside `.bun-tmp` without changing the baseline manifest or
-lockfile. Hosted CI and live Kiro acceptance were not run.
+verification of the earlier two-lane matrix with Bun 1.4.4 passed `bun run ci`
+(144 tests), recursive graph checks, assertion-helper self-tests, existing
+registration, pack inspection, and provider-free tarball registration. The older
+lane used an isolated copy inside `.bun-tmp` without changing the baseline
+manifest or lockfile. Hosted CI and live Kiro acceptance were not run for that
+local verification.
 
 ## Pi 1.5.0 compatibility review
 
@@ -152,8 +154,8 @@ No Kiro runtime changes are needed for this upgrade:
   USD. Mocked regressions cover both usage paths without claiming provider
   billing metadata.
 - Pi's native extension-update notices read the root `CHANGELOG.md` by default.
-  Package version `2026.1104.2` (release tag `v20261104-2`) and its matching
-  `## [2026.1104.2]` heading allow the next fresh launch after an update to show
+  Package version `2026.1121.1` (release tag `v20261121-1`) and its matching
+  `## [2026.1121.1]` heading allow the next fresh launch after an update to show
   these notes. First discovery records the version without a notice;
   `/changelog` does not show extension package changelogs.
 - Authentication, discovery, instrumentation hooks, cancellation, bounded

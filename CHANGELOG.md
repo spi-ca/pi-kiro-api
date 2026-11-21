@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.1121.1]
+
+- Align the package version and changelog heading with release `v20261121-1`.
+- Add an exact Pi `1.6.0` lane to provider-free CI. Keep the locked Pi `1.5.1` development graph, the `0.87.1` transcript compatibility lane, and wildcard host peers.
+- Provider authentication, model routing, and streaming are unchanged. CI does not call the Kiro service.
+
 ## [2026.1104.2]
 
 - Adopt date-based package versioning for release `v20261104-2`, with a matching changelog heading for Pi's extension-update notices.
